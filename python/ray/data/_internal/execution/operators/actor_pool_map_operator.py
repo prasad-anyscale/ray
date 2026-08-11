@@ -14,6 +14,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    NoReturn,
     Optional,
     Tuple,
     Union,
@@ -21,10 +22,16 @@ from typing import (
 
 from typing_extensions import override
 
+from ray.data._internal.execution.resource_bank import LogicalActorId
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
+    from ray.data._internal.experimental.execution.operators.placement_constraints import (  # noqa: E501
+        PlacementConstraint,
+    )
 import ray
 from ray.actor import ActorHandle
 from ray.core.generated import gcs_pb2
@@ -41,6 +48,11 @@ from ray.data._internal.execution.bundle_queue import (
     BaseBundleQueue,
     RebundleQueue,
     create_bundle_queue,
+)
+from ray.data._internal.execution.execution_flags import (
+    CORE_ACTOR_BACKPRESSURE_NUM_OBJECTS_PER_YIELD,
+    actor_only_backend_enabled,
+    core_actor_backpressure_enabled,
 )
 from ray.data._internal.execution.interfaces import (
     BlockSlice,
@@ -66,6 +78,10 @@ from ray.data._internal.utils.heapdict import heapdict
 from ray.data.block import Block, BlockMetadata
 from ray.data.context import (
     DEFAULT_ACTOR_MAX_TASKS_IN_FLIGHT_TO_MAX_CONCURRENCY_FACTOR,
+    DEFAULT_WAIT_FOR_MIN_ACTORS_ACTOR_ONLY_S,
+    DEFAULT_WAIT_FOR_MIN_ACTORS_MAX_S,
+    DEFAULT_WAIT_FOR_MIN_ACTORS_PER_ACTOR_S,
+    DEFAULT_WAIT_FOR_MIN_ACTORS_STALL_S,
     DataContext,
 )
 from ray.types import ObjectRef
@@ -76,13 +92,27 @@ _ACTOR_STATE_DEAD = gcs_pb2.ActorTableData.ActorState.DEAD
 _ACTOR_STATE_ALIVE = gcs_pb2.ActorTableData.ActorState.ALIVE
 _ACTOR_STATE_RESTARTING = gcs_pb2.ActorTableData.ActorState.RESTARTING
 
-# Type alias for the logical identifier of an actor (used in labels and actor-to-id maps).
-LogicalActorId = str
-
 
 def get_map_worker_cls_name(op_name: str) -> str:
     """Return the dynamic class name used for actor pool map workers."""
     return f"MapWorker({op_name})"
+
+
+def wait_for_min_actors_budget_s(num_actors: int) -> float:
+    """Overall wait budget for ``num_actors`` initial actors to come up.
+
+    Grows linearly with the pool's minimum size (a bigger minimum may need
+    several nodes autoscaled in) and saturates at
+    ``DEFAULT_WAIT_FOR_MIN_ACTORS_MAX_S``. With the defaults: 1 actor -> ~5min,
+    20 -> 10min, 100 -> 30min (capped). This is only the ceiling; the wait
+    normally ends far sooner, and a stalled pool fails after
+    ``DEFAULT_WAIT_FOR_MIN_ACTORS_STALL_S`` without waiting out the budget.
+    """
+    budget = (
+        DEFAULT_WAIT_FOR_MIN_ACTORS_ACTOR_ONLY_S
+        + DEFAULT_WAIT_FOR_MIN_ACTORS_PER_ACTOR_S * max(num_actors, 0)
+    )
+    return float(min(budget, DEFAULT_WAIT_FOR_MIN_ACTORS_MAX_S))
 
 
 class ActorPoolMapOperator(MapOperator):
@@ -101,6 +131,21 @@ class ActorPoolMapOperator(MapOperator):
     to actual execution).
     """
 
+    # Cadence of the ``wait_for_min_actors`` poll loop, and how often it logs
+    # progress while actors are still coming up.
+    MIN_ACTORS_POLL_INTERVAL_S: float = 1.0
+    MIN_ACTORS_LOG_INTERVAL_S: float = 30.0
+
+    def placement_constraint(self) -> Optional["PlacementConstraint"]:
+        """This op's scheduling constraints for the operator-sizer's
+        constraint-aware placement path.
+
+        Only the experimental actor-pool operator (sized by that path) parses
+        and returns a constraint; the OSS operator is not constraint-aware, so
+        it reports ``None`` ("no constraint / not supported").
+        """
+        return None
+
     def __init__(
         self,
         map_transformer: MapTransformer,
@@ -118,6 +163,7 @@ class ActorPoolMapOperator(MapOperator):
         target_max_block_size_override: Optional[int] = None,
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
         default_logical_memory_enabled: bool = False,
+        is_read_op: bool = False,
     ):
         """Create an ActorPoolMapOperator instance.
 
@@ -152,6 +198,7 @@ class ActorPoolMapOperator(MapOperator):
             default_logical_memory_enabled: If ``True``, the operator launches actors
                 with a default logical ``memory``. The method for choosing the
                 default is an implementation detail.
+            is_read_op: Whether this op reads from a datasource.
         """
         super().__init__(
             map_transformer,
@@ -171,6 +218,18 @@ class ActorPoolMapOperator(MapOperator):
 
         self._min_rows_per_bundle = min_rows_per_bundle
         self._ray_remote_args_fn = ray_remote_args_fn
+
+        # _generator_backpressure_num_objects is a task-level option that is
+        # invalid for actor creation. Planners like plan_list_files_op put it
+        # in ray_remote_args (the right place for TaskPoolMapOperator); migrate
+        # it to actor task args so it doesn't blow up ray.remote(**actor_args).
+        if "_generator_backpressure_num_objects" in self._ray_remote_args:
+            ray_actor_task_remote_args = (ray_actor_task_remote_args or {}).copy()
+            ray_actor_task_remote_args.setdefault(
+                "_generator_backpressure_num_objects",
+                self._ray_remote_args.pop("_generator_backpressure_num_objects"),
+            )
+
         self._ray_remote_args = self._apply_default_remote_args(
             self._ray_remote_args, self.data_context
         )
@@ -184,9 +243,15 @@ class ActorPoolMapOperator(MapOperator):
         # HACK: Without this, all actors show up as `_MapWorker` in Grafana, so we can’t
         # tell which operator they belong to. To fix that, we dynamically create a new
         # class per operator with a unique name.
-        self._map_worker_cls = type(map_worker_cls_name, (_MapWorker,), {})
+        self._map_worker_cls = _configure_map_worker_for_core_backpressure(
+            type(map_worker_cls_name, (_MapWorker,), {}),
+            self.data_context,
+        )
 
-        self._actor_pool = self._create_actor_pool(compute_strategy)
+        self.is_read_op = is_read_op
+        self._actor_pool: "AutoscalingActorPool" = self._create_actor_pool(
+            compute_strategy
+        )
         # A queue of bundles awaiting dispatch to actors.
         self._bundle_queue = create_bundle_queue()
         # Cached actor class.
@@ -259,7 +324,15 @@ class ActorPoolMapOperator(MapOperator):
             ray_actor_task_remote_args["retry_exceptions"] = actor_task_errors
         _add_system_error_to_retry_exceptions(ray_actor_task_remote_args)
 
-        if (
+        if core_actor_backpressure_enabled():
+            # Actor-wide AGBPO (``_actor_generator_backpressure_num_objects`` on the
+            # actor) owns generator backpressure. Per-task
+            # ``_generator_backpressure_num_objects`` must be disabled (-1) so it
+            # does not compete with the actor-wide waiter.
+            ray_actor_task_remote_args.setdefault(
+                "_generator_backpressure_num_objects", -1
+            )
+        elif (
             "_generator_backpressure_num_objects" not in ray_actor_task_remote_args
             and data_context._max_num_blocks_in_streaming_gen_buffer is not None
         ):
@@ -276,38 +349,156 @@ class ActorPoolMapOperator(MapOperator):
         self,
         options: ExecutionOptions,
         block_ref_counter: "BlockRefCounter",
+        resource_bank: Optional[ResourceBankBase] = None,
     ):
         self._actor_locality_enabled = options.actor_locality_enabled
-        super().start(options, block_ref_counter)
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
 
         self._actor_cls = ray.remote(**self._ray_remote_args)(self._map_worker_cls)
+        self._scale_to_initial_size()
+        self.wait_for_min_actors()
+
+    def wait_for_min_actors(self) -> None:
+        """Block until the pool's initial actors are up.
+
+        Uses ``wait_for_min_actors_s`` as a fixed deadline when explicitly set
+        (> 0). When unset and the actor-only backend is enabled, the deadline
+        instead scales with the number of actors we're waiting on (see
+        ``wait_for_min_actors_budget_s``) and the wait additionally aborts as
+        soon as actor startup stalls, so a wedged pool fails fast no matter how
+        large its budget is.
+
+        Must run AFTER the initial actors were created -- under the operator
+        sizer that happens in ``OperatorSizer.initial_sizing_request`` (not in
+        ``start``), so the sizer-managed executor calls this again after its
+        initial sizing pass; waiting here in ``start`` would see no pending
+        refs and return immediately.
+        """
+        configured = self.data_context.wait_for_min_actors_s
+        if configured <= 0 and not actor_only_backend_enabled():
+            return
+        refs = self._actor_pool.get_pending_actor_refs()
+        if not refs:
+            return
+
+        if configured > 0:
+            # Explicitly configured: honor it verbatim as a hard deadline.
+            timeout, stall_timeout = float(configured), None
+        else:
+            timeout = wait_for_min_actors_budget_s(len(refs))
+            stall_timeout = float(DEFAULT_WAIT_FOR_MIN_ACTORS_STALL_S)
+            if timeout > DEFAULT_WAIT_FOR_MIN_ACTORS_ACTOR_ONLY_S:
+                # Large minimums block the whole dataset before any work
+                # starts; make that visible rather than looking hung.
+                logger.warning(
+                    f"{self._name}: waiting for {len(refs)} minimum actors to "
+                    f"start before execution begins (up to {timeout:.0f}s, "
+                    f"aborting early if no actor starts for {stall_timeout:.0f}s). "
+                    "Large per-operator minimum concurrency delays the start of "
+                    "the whole dataset."
+                )
+
+        logger.debug(
+            f"{self._name}: Waiting for {len(refs)} pool actors to start "
+            f"(for {timeout}s)..."
+        )
+        self._wait_for_pending_actors(refs, timeout, stall_timeout)
+
+    def _wait_for_pending_actors(
+        self,
+        refs: List[ObjectRef],
+        timeout_s: float,
+        stall_timeout_s: Optional[float],
+    ) -> None:
+        """Wait for ``refs`` to resolve, tracking startup progress.
+
+        Args:
+            refs: Pending actor readiness refs.
+            timeout_s: Overall budget for the whole set.
+            stall_timeout_s: If set, also fail when no ref resolves within this
+                many seconds of the last one that did.
+        """
+        total = len(refs)
+        pending = list(refs)
+        start_t = time.perf_counter()
+        last_progress_t = start_t
+        last_log_t = start_t
+
+        while pending:
+            now = time.perf_counter()
+            budget = start_t + timeout_s - now
+            stalled = stall_timeout_s is not None and (
+                now - last_progress_t >= stall_timeout_s
+            )
+            if budget <= 0 or stalled:
+                self._raise_min_actors_timeout(
+                    num_started=total - len(pending),
+                    total=total,
+                    elapsed_s=now - start_t,
+                    stalled_for_s=(now - last_progress_t) if stalled else None,
+                )
+            if stall_timeout_s is not None:
+                budget = min(budget, stall_timeout_s - (now - last_progress_t))
+
+            ready, pending = ray.wait(
+                pending,
+                num_returns=len(pending),
+                timeout=min(budget, self.MIN_ACTORS_POLL_INTERVAL_S),
+            )
+            if ready:
+                # Surfaces actor construction failures (e.g. a raising
+                # __init__) immediately instead of at first task submission.
+                ray.get(ready)
+                last_progress_t = time.perf_counter()
+
+            now = time.perf_counter()
+            if pending and now - last_log_t >= self.MIN_ACTORS_LOG_INTERVAL_S:
+                last_log_t = now
+                logger.info(
+                    f"{self._name}: {total - len(pending)}/{total} minimum "
+                    f"actors started after {now - start_t:.0f}s."
+                )
+
+    def _raise_min_actors_timeout(
+        self,
+        *,
+        num_started: int,
+        total: int,
+        elapsed_s: float,
+        stalled_for_s: Optional[float],
+    ) -> NoReturn:
+        if stalled_for_s is not None:
+            cause = (
+                f"no additional actor started in the last {stalled_for_s:.0f}s "
+                f"({num_started}/{total} up after {elapsed_s:.0f}s)"
+            )
+        else:
+            cause = (
+                f"only {num_started}/{total} actors started within the "
+                f"{elapsed_s:.0f}s budget"
+            )
+        message = (
+            f"{self._name}: timed out waiting for the operator's minimum "
+            f"actors to start -- {cause}. This usually means the cluster "
+            "cannot fit every operator's minimum actors at once -- tune the "
+            "DAG's per-operator minimum concurrency so all minimums fit, or "
+            "increase RAY_DATA_DEFAULT_WAIT_FOR_MIN_ACTORS_S if your "
+            "infrastructure needs longer to provision nodes."
+        )
+        logger.error(message)
+        raise ray.exceptions.GetTimeoutError(message)
+
+    def _scale_to_initial_size(self) -> None:
+        """Create the pool's initial actors (untargeted; Ray core places them).
+
+        Overridden by the sizer-managed experimental operator, where initial
+        sizing must go through the sizer's constraint-aware placement instead.
+        """
         self._actor_pool.scale(
             ActorPoolScalingRequest(
                 delta=self._actor_pool.initial_size(), reason="scaling to initial size"
             )
         )
-
-        # If `wait_for_min_actors_s` is specified and is positive, then
-        # Actor Pool will block until min number of actors is provisioned.
-        #
-        # Otherwise, all actors will be provisioned asynchronously.
-        if self.data_context.wait_for_min_actors_s > 0:
-            refs = self._actor_pool.get_pending_actor_refs()
-
-            logger.debug(
-                f"{self._name}: Waiting for {len(refs)} pool actors to start "
-                f"(for {self.data_context.wait_for_min_actors_s}s)..."
-            )
-
-            try:
-                timeout = self.data_context.wait_for_min_actors_s
-                ray.get(refs, timeout=timeout)
-            except ray.exceptions.GetTimeoutError:
-                raise ray.exceptions.GetTimeoutError(
-                    "Timed out while starting actors. "
-                    "This may mean that the cluster does not have "
-                    "enough resources for the requested actor pool."
-                )
 
     def can_add_input(self) -> bool:
         """NOTE: PLEASE READ CAREFULLY
@@ -320,7 +511,9 @@ class ActorPoolMapOperator(MapOperator):
             should be able to launch a task.
 
         """
-        return self._actor_pool.can_schedule_task()
+        return self._actor_pool.can_schedule_task(
+            bundle=None, ale=self._actor_locality_enabled
+        )
 
     def _start_actor(
         self, labels: Dict[str, str], logical_actor_id: LogicalActorId
@@ -450,13 +643,9 @@ class ActorPoolMapOperator(MapOperator):
 
             self._metrics.on_input_dequeued(bundle, input_index=0)
             input_blocks = [entry.ref for entry in bundle.blocks]
-            self._actor_pool.on_task_submitted(actor)
+            self._actor_pool.on_task_submitted(actor, input_bundle=bundle)
 
-            ctx = TaskContext(
-                task_idx=self._next_data_task_idx,
-                op_name=self.name,
-                target_max_block_size_override=self.target_max_block_size_override,
-            )
+            ctx = self._create_task_context(actor)
             actor_task_args = dict(self._ray_actor_task_remote_args)
             extra_labels = actor_task_args.pop("_labels", None) or {}
             gen = actor.submit.options(
@@ -471,28 +660,58 @@ class ActorPoolMapOperator(MapOperator):
                 **self.get_map_task_kwargs(),
             )
 
-            def _task_done_callback(actor_to_return):
+            def _task_done_callback(
+                inputs: RefBundle,
+                task_index: int,
+                exception: Optional[Exception],
+                actor_to_return: ActorHandle[_MapWorker],
+            ):
                 # Return the actor that was running the task to the pool.
-                self._actor_pool.on_task_completed(actor_to_return)
+                self._actor_pool.on_task_completed(actor_to_return, input_bundle=inputs)
 
             from functools import partial
 
             self._submit_data_task(
-                gen, bundle, partial(_task_done_callback, actor_to_return=actor)
+                gen=gen,
+                inputs=bundle,
+                task_done_callback=partial(
+                    _task_done_callback,
+                    actor_to_return=actor,
+                ),
             )
 
             num_submitted_tasks += 1
 
             # Update locality metrics
-            if (
-                self._actor_pool.get_actor_location(actor)
-                in bundle.get_preferred_object_locations()
-            ):
+            actor_node_id = self._actor_pool.get_actor_location(actor)
+            if actor_node_id in bundle.get_preferred_object_locations():
                 self._locality_hits += 1
             else:
                 self._locality_misses += 1
+            # Cross-node input transfer: input blocks whose producing node is not
+            # the actor's node are fetched over the network. Mirrors the
+            # actor-only backend (ExperimentalAPMO) so the legacy backend reports
+            # the same cross-node metrics for A/B comparison; uses bundle.metadata
+            # node attribution (same source) on both sides.
+            remote_bytes = 0
+            remote_blocks = 0
+            for bm in bundle.metadata:
+                if bm.exec_stats is not None and bm.exec_stats.node_id != actor_node_id:
+                    remote_bytes += bm.size_bytes
+                    remote_blocks += 1
+            if remote_blocks:
+                self._metrics.bytes_remote_inputs_read += remote_bytes
+                self._metrics.num_remote_blocks_read += remote_blocks
 
         return num_submitted_tasks
+
+    def _create_task_context(self, actor: ActorHandle) -> TaskContext:
+        """Build the ``TaskContext`` for a task submitted to ``actor``"""
+        return TaskContext(
+            task_idx=self._next_data_task_idx,
+            op_name=self.name,
+            target_max_block_size_override=self.target_max_block_size_override,
+        )
 
     def _merge_ray_remote_args(self) -> Dict[str, Any]:
         """When `self._ray_remote_args_fn` is specified, this method should
@@ -528,10 +747,6 @@ class ActorPoolMapOperator(MapOperator):
         return super().has_next()
 
     def all_inputs_done(self):
-        # Call base implementation to handle any leftover bundles. This may or may not
-        # trigger task dispatch.
-        super().all_inputs_done()
-
         if self._metrics.num_inputs_received < self._actor_pool.min_size():
             warnings.warn(
                 f"The minimum number of concurrent actors for '{self.name}' is set to "
@@ -542,6 +757,8 @@ class ActorPoolMapOperator(MapOperator):
                 "You might be able to increase the number of concurrent tasks by "
                 "configuring `override_num_blocks` earlier in the pipeline."
             )
+
+        super().all_inputs_done()
 
     def _do_shutdown(self, force: bool = False):
         self._actor_pool.shutdown(force=force)
@@ -732,6 +949,7 @@ class _MapWorker:
             ctx,
             *blocks,
             slices=slices,
+            actor_id=self._logical_actor_id,
             **kwargs,
         )
 
@@ -758,6 +976,24 @@ class _MapWorker:
         # Delete it to trigger `UDF.__del__`.
         del ray.data._map_actor_context
         ray.data._map_actor_context = None
+
+
+def _configure_map_worker_for_core_backpressure(
+    map_worker_cls: type, data_context: DataContext
+) -> type:
+    """Apply static grouped-yield config to MapWorker when core backpressure is on."""
+    if not core_actor_backpressure_enabled():
+        return map_worker_cls
+    if getattr(map_worker_cls.submit, "__ray_num_objects_per_yield__", None) == (
+        CORE_ACTOR_BACKPRESSURE_NUM_OBJECTS_PER_YIELD
+    ):
+        data_context._use_grouped_streaming_generator_yields = True
+        return map_worker_cls
+    map_worker_cls.submit = ray.method(
+        _num_objects_per_yield=CORE_ACTOR_BACKPRESSURE_NUM_OBJECTS_PER_YIELD,
+    )(map_worker_cls.submit)
+    data_context._use_grouped_streaming_generator_yields = True
+    return map_worker_cls
 
 
 @dataclass
@@ -792,7 +1028,7 @@ class _ActorPool(AutoscalingActorPool):
 
     def __init__(
         self,
-        create_actor_fn: "Callable[[Dict[str, str]], Tuple[ActorHandle, ObjectRef[Any], ExecutionResources]]",
+        create_actor_fn: "Callable[[Dict[str, str], LogicalActorId], Tuple[ActorHandle, ObjectRef[Any], ExecutionResources]]",
         config: AutoscalingActorConfig,
         map_worker_cls_name: str = "MapWorker",
         debounce_period_s: int = _ACTOR_POOL_SCALE_DOWN_DEBOUNCE_PERIOD_S,
@@ -866,6 +1102,12 @@ class _ActorPool(AutoscalingActorPool):
         return self._num_restarting_actors
 
     @override
+    def num_terminating_actors(self) -> int:
+        """Always 0: this pool kills actors outright rather than draining them,
+        so ``serving_size`` and ``current_size`` always agree here."""
+        return 0
+
+    @override
     def num_active_actors(self) -> int:
         """Active actors are all the running actors with inflight tasks."""
         return self._num_active_actors
@@ -928,7 +1170,7 @@ class _ActorPool(AutoscalingActorPool):
             self._update_running_actor_state(actor)
 
     @override
-    def on_task_submitted(self, actor: ActorHandle):
+    def on_task_submitted(self, actor: ActorHandle, input_bundle: RefBundle):
         state = self._running_actors[actor]
         state.num_tasks_in_flight += 1
         self._total_num_tasks_in_flight += 1
@@ -1043,7 +1285,7 @@ class _ActorPool(AutoscalingActorPool):
             return None
 
         _, least_busy_rank = self._alive_actors_to_in_flight_tasks_heap.peekitem()
-        if least_busy_rank >= self.max_tasks_in_flight_per_actor():
+        if least_busy_rank >= self.default_max_tasks_in_flight_per_actor():
             return None
 
         target_actor: Optional[ActorHandle] = None
@@ -1057,7 +1299,7 @@ class _ActorPool(AutoscalingActorPool):
         return target_actor
 
     @override
-    def on_task_completed(self, actor: ActorHandle):
+    def on_task_completed(self, actor: ActorHandle, input_bundle: RefBundle):
         """Called when a task completes. Returns the provided actor to the pool."""
         state = self._running_actors[actor]
         assert state.num_tasks_in_flight > 0
@@ -1073,10 +1315,29 @@ class _ActorPool(AutoscalingActorPool):
             if node_heap is not None and actor in node_heap:
                 node_heap[actor] = rank
 
-    # === End of overriding methods of AutoscalingActorPool ===
-
-    def _get_actor_logical_id(self, actor: ActorHandle) -> LogicalActorId:
+    @override
+    def get_actor_logical_id(self, actor: ActorHandle) -> LogicalActorId:
         return self._actor_to_logical_id[actor]
+
+    @override
+    def get_logical_ids(self) -> List[LogicalActorId]:
+        """Get the logical IDs for pending and running actors in the actor pool.
+
+        We can't use Ray Core actor IDs because we need to identify actors by labels,
+        but labels must be set before creation, and actor IDs aren't available until
+        after.
+        """
+        return list(self._actor_to_logical_id.values())
+
+    @override
+    def current_logical_usage(self) -> ExecutionResources:
+        return self._total_usage
+
+    @override
+    def pending_logical_usage(self) -> ExecutionResources:
+        return self._pending_or_restarting_usage
+
+    # === End of overriding methods of AutoscalingActorPool ===
 
     def _can_apply_request(self, req: ActorPoolScalingRequest) -> bool:
         """Returns whether Actor Pool is able to execute scaling request"""
@@ -1170,7 +1431,10 @@ class _ActorPool(AutoscalingActorPool):
             rank = _ActorRank(state.num_tasks_in_flight)
             self._alive_node_to_actor_heap[node_id][actor] = rank
             if actor not in self._alive_actors_to_in_flight_tasks_heap:
-                assert state.num_tasks_in_flight <= self.max_tasks_in_flight_per_actor()
+                assert (
+                    state.num_tasks_in_flight
+                    <= self.default_max_tasks_in_flight_per_actor()
+                )
                 self._alive_actors_to_in_flight_tasks_heap[actor] = rank
         else:
             if actor in self._alive_actors_to_in_flight_tasks_heap:
@@ -1202,15 +1466,6 @@ class _ActorPool(AutoscalingActorPool):
         self._pending_or_restarting_usage = self._pending_or_restarting_usage.add(
             resource_usage
         )
-
-    def _get_logical_ids(self) -> List[LogicalActorId]:
-        """Get the logical IDs for pending and running actors in the actor pool.
-
-        We can't use Ray Core actor IDs because we need to identify actors by labels,
-        but labels must be set before creation, and actor IDs aren't available until
-        after.
-        """
-        return list(self._actor_to_logical_id.values())
 
     def _remove_inactive_actor(self) -> bool:
         """Kills a single pending or idle actor, if any actors are pending/idle.
@@ -1338,7 +1593,7 @@ class _ActorPool(AutoscalingActorPool):
         if not preferred_locs:
             return None
 
-        max_tasks = self.max_tasks_in_flight_per_actor()
+        max_tasks = self.default_max_tasks_in_flight_per_actor()
 
         for node_id, _total_bytes in sorted(
             preferred_locs.items(), key=lambda item: (-item[1], item[0])
@@ -1351,9 +1606,3 @@ class _ActorPool(AutoscalingActorPool):
                 return actor
 
         return None
-
-    def current_logical_usage(self) -> ExecutionResources:
-        return self._total_usage
-
-    def pending_logical_usage(self) -> ExecutionResources:
-        return self._pending_or_restarting_usage

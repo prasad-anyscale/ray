@@ -8,6 +8,9 @@ from ray.util.metrics import Histogram
 # Node id string returned by `ray.get_runtime_context().get_node_id()`.
 NodeIdStr = str
 
+# Logical identifier of an actor (used in labels and actor-to-id maps).
+LogicalActorId = str
+
 # Used for time-based histograms (e.g. task completion time, block completion time)
 histogram_buckets_s = [
     0.1,

@@ -114,6 +114,9 @@ class ActorPoolStrategy(ComputeStrategy):
         max_size: Optional[int] = None,
         initial_size: Optional[int] = None,
         max_tasks_in_flight_per_actor: Optional[int] = None,
+        max_num_output_bytes_per_actor: Optional[int] = None,
+        max_num_outputs_per_actor: Optional[int] = None,
+        max_input_bytes_per_actor: Optional[int] = None,
         enable_true_multi_threading: Optional[bool] = None,
     ):
         """Construct ActorPoolStrategy for a Dataset transform.
@@ -130,6 +133,12 @@ class ActorPoolStrategy(ComputeStrategy):
                 opportunities for pipelining task dependency prefetching with
                 computation and avoiding actor startup delays, but will also increase
                 queueing delay.
+            max_num_output_bytes_per_actor: Per-actor cap on outstanding output
+                bytes, used by the actor-only backend's output backpressure.
+            max_num_outputs_per_actor: Per-actor cap on outstanding output
+                blocks, used by the actor-only backend's output backpressure.
+            max_input_bytes_per_actor: Per-actor soft cap on in-flight input
+                bytes, used by the actor-only backend as a scheduling preference.
             enable_true_multi_threading: If enable_true_multi_threading=False, no more
                 than 1 UDF runs per actor. Otherwise, respects the `max_concurrency` argument.
                 By default, this flag is `None`, which gets translated to `False`.
@@ -179,19 +188,10 @@ class ActorPoolStrategy(ComputeStrategy):
         self.max_tasks_in_flight_per_actor = max_tasks_in_flight_per_actor
         self.num_workers = 0
         self.ready_to_total_workers_ratio = 0.8
-        self._enable_true_multi_threading = enable_true_multi_threading
-
-    @property
-    def enable_true_multi_threading(self) -> bool:
-        # backwards compatibility from serialization: instances pickled
-        # before this became a property carry the value under the public
-        # name instead.
-        return bool(
-            self.__dict__.get(
-                "_enable_true_multi_threading",
-                self.__dict__.get("enable_true_multi_threading"),
-            )
-        )
+        self.enable_true_multi_threading = enable_true_multi_threading
+        self.max_num_output_bytes_per_actor = max_num_output_bytes_per_actor
+        self.max_num_outputs_per_actor = max_num_outputs_per_actor
+        self.max_input_bytes_per_actor = max_input_bytes_per_actor
 
     def __eq__(self, other: Any) -> bool:
         # intentionally compare resolved enable_true_multi_threading values
@@ -203,17 +203,23 @@ class ActorPoolStrategy(ComputeStrategy):
             and self.enable_true_multi_threading == other.enable_true_multi_threading
             and self.max_tasks_in_flight_per_actor
             == other.max_tasks_in_flight_per_actor
+            and self.max_num_output_bytes_per_actor
+            == other.max_num_output_bytes_per_actor
+            and self.max_num_outputs_per_actor == other.max_num_outputs_per_actor
+            and self.max_input_bytes_per_actor == other.max_input_bytes_per_actor
         )
 
     def __repr__(self) -> str:
         return (
-            f"ActorPoolStrategy(min_size={self.min_size}, "
+            f"ActorPoolStrategy("
+            f"min_size={self.min_size}, "
             f"max_size={self.max_size}, "
             f"initial_size={self.initial_size}, "
-            f"max_tasks_in_flight_per_actor={self.max_tasks_in_flight_per_actor})"
-            f"num_workers={self.num_workers}, "
-            f"enable_true_multi_threading={self.enable_true_multi_threading}, "
-            f"ready_to_total_workers_ratio={self.ready_to_total_workers_ratio})"
+            f"max_tasks_in_flight_per_actor={self.max_tasks_in_flight_per_actor}, "
+            f"max_num_output_bytes_per_actor={self.max_num_output_bytes_per_actor}, "
+            f"max_num_outputs_per_actor={self.max_num_outputs_per_actor}, "
+            f"max_input_bytes_per_actor={self.max_input_bytes_per_actor}, "
+            f"enable_true_multi_threading={self.enable_true_multi_threading})"
         )
 
 
@@ -231,3 +237,26 @@ def get_compute(compute_spec: Union[str, ComputeStrategy]) -> ComputeStrategy:
         return compute_spec
     else:
         raise ValueError("compute must be one of [`tasks`, `actors`, ComputeStrategy]")
+
+
+@DeveloperAPI
+def maybe_promote_compute_strategy(
+    compute_strategy: ComputeStrategy,
+) -> ComputeStrategy:
+    """Promote a ``TaskPoolStrategy`` to an ``ActorPoolStrategy`` for the
+    actor-only backend.
+
+    When the actor-only backend (``RAY_DATA_ACTOR_ONLY_BACKEND``) is enabled,
+    transparently promote any ``TaskPoolStrategy`` to an equivalent
+    ``ActorPoolStrategy`` so all map ops execute on the actor backend.
+    Fixed-size task pools map to fixed-size actor pools; unsized task pools map
+    to a default autoscaling actor pool.
+
+    This is self-gated so callers (e.g. ``MapOperator.create``) stay
+    backend-agnostic: it is a no-op unless the actor-only backend is enabled.
+    """
+    from ray.data._internal.execution.execution_flags import actor_only_backend_enabled
+
+    if actor_only_backend_enabled() and isinstance(compute_strategy, TaskPoolStrategy):
+        return ActorPoolStrategy(size=compute_strategy.size)
+    return compute_strategy

@@ -27,6 +27,9 @@ from ray.data._internal.execution.operators.shuffle_operators.shuffle_map_operat
     ShuffleMapOp,
 )
 from ray.data._internal.execution.operators.zip_operator import ZipOperator
+from ray.data._internal.execution.resource_bank import (
+    ResourceBankBase,
+)
 from ray.data._internal.execution.util import memory_string
 from ray.data.context import DataContext
 from ray.util.debug import log_once
@@ -338,7 +341,13 @@ class ResourceManager:
             + self._get_downstream_ineligible_ops_usage(op).object_store_memory
         )
 
-    def get_op_usage_str(self, op: PhysicalOperator, *, verbose: bool) -> str:
+    def get_op_usage_str(
+        self,
+        op: PhysicalOperator,
+        *,
+        verbose: bool,
+        resource_bank: Optional[ResourceBankBase] = None,
+    ) -> str:
         """Return a human-readable string representation of the resource usage of
         the given operator."""
         # Handle case where operator is not in _op_running_usages dict
@@ -350,7 +359,12 @@ class ResourceManager:
                 usage_str += f", {self._op_running_usages[op].memory_str()} memory"
             if self._op_running_usages[op].gpu:
                 usage_str += f", {self._op_running_usages[op].gpu:.1f} GPU"
-            usage_str += f", {self._op_running_usages[op].object_store_memory_str()} object store"
+            if resource_bank is not None:
+                object_store = resource_bank.live_object_store(op=op)
+                object_store_str = memory_string(object_store.total_bytes())
+            else:
+                object_store_str = self._op_running_usages[op].object_store_memory_str()
+            usage_str += f", {object_store_str} object store"
 
         # NOTE: Config can override requested verbosity level
         if LOG_DEBUG_TELEMETRY_FOR_RESOURCE_MANAGER_OVERRIDE is not None:

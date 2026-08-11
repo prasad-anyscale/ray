@@ -956,6 +956,37 @@ def test_create_cluster_autoscaler_forwards_label_selector(monkeypatch):
     assert captured["label_selector"] == {"ray-subcluster": "training"}
 
 
+def test_create_cluster_autoscaler_forwards_coordinator_and_gauge_to_v2(monkeypatch):
+    """The factory forwards an injected coordinator and utilization gauge to
+    ``DefaultClusterAutoscalerV2``. This is the seam the actor-only path uses to
+    share one coordinator with the sizer and feed a reporter-backed gauge."""
+    captured = {}
+
+    class _StubV2:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(ca_pkg, "DefaultClusterAutoscalerV2", _StubV2)
+    monkeypatch.setenv("RAY_DATA_CLUSTER_AUTOSCALER", "V2")
+
+    coordinator = object()
+    gauge = object()
+    data_context = Mock()
+    data_context.execution_options.resource_limits = Mock()
+    data_context.execution_options.label_selector = {}
+
+    create_cluster_autoscaler(
+        topology=Mock(),
+        resource_manager=Mock(),
+        data_context=data_context,
+        execution_id="exec-1",
+        autoscaling_coordinator=coordinator,
+        resource_utilization_calculator=gauge,
+    )
+    assert captured["autoscaling_coordinator"] is coordinator
+    assert captured["resource_utilization_calculator"] is gauge
+
+
 if __name__ == "__main__":
     import sys
 

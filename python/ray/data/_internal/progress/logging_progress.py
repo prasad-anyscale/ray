@@ -19,6 +19,7 @@ from ray.data._internal.progress.base_progress import (
 from ray.data._internal.progress.utils import truncate_operator_name
 
 if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
     from ray.data._internal.execution.resource_manager import ResourceManager
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
 
@@ -206,7 +207,11 @@ class LoggingExecutionProgressManager(BaseExecutionProgressManager):
 
     # Operator Progress
     def update_operator_progress(
-        self, opstate: "OpState", resource_manager: "ResourceManager"
+        self,
+        opstate: "OpState",
+        resource_manager: "ResourceManager",
+        extra_summary: str = "",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ):
         op_metrics = self._op_progress_metrics.get(opstate)
         if op_metrics is not None:
@@ -214,7 +219,12 @@ class LoggingExecutionProgressManager(BaseExecutionProgressManager):
             total = opstate.op.num_output_rows_total()
             if total is not None:
                 op_metrics.total = total
-            op_metrics.desc = format_op_state_summary(opstate, resource_manager)
+            op_metrics.desc = format_op_state_summary(
+                opstate,
+                resource_manager,
+                extra_summary=extra_summary,
+                resource_bank=resource_bank,
+            )
 
 
 def _format_progress(m: _LoggingMetrics) -> str:

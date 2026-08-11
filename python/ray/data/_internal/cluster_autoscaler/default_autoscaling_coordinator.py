@@ -3,8 +3,8 @@ import functools
 import logging
 import threading
 import time
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
 
 import ray
 import ray.exceptions
@@ -135,6 +135,10 @@ class OngoingRequest:
     # Empty dicts mean no label constraint on that bundle. Required to have
     # the same length as ``requested_resources``.
     requested_label_selectors: List[LabelSelector]
+    # Allocated resources keyed by the node id they were bin-packed onto,
+    # merged per node. Kept in sync with ``reserved_resources`` by
+    # ``_rereserve_resources``.
+    reserved_by_node: Dict[str, ResourceDict] = field(default_factory=dict)
 
     def __lt__(self, other):
         """Used to sort requests when reserving resources.
@@ -169,6 +173,8 @@ class DefaultAutoscalingCoordinator(AutoscalingCoordinator):
         self._cached_reserved_resources: List[ResourceDict] = []
         # In-flight get_reserved_resources ref, or None if no request is pending.
         self._pending_reserved_resources: Optional[ray.ObjectRef] = None
+        self._cached_reserved_resources_by_node: Dict[str, ResourceDict] = {}
+        self._pending_reserved_resources_by_node: Optional[ray.ObjectRef] = None
         if autoscaling_coordinator_actor is not None:
             # Bypass the cached_property by injecting the actor directly.
             # Used in tests to avoid the shared named actor.
@@ -210,10 +216,53 @@ class DefaultAutoscalingCoordinator(AutoscalingCoordinator):
         """
         self._pending_reserved_resources = None
         self._cached_reserved_resources = []
+        self._pending_reserved_resources_by_node = None
+        self._cached_reserved_resources_by_node = {}
         self._autoscaling_coordinator.cancel_request.remote(self._requester_id)
 
+    def _poll_cached(
+        self,
+        pending_attr: str,
+        cached_attr: str,
+        remote_method: Callable,
+        label: str,
+    ):
+        """Non-blocking cached read of a coordinator allocation getter.
+
+        Submits an async RPC and immediately returns the last cached result.
+        The cache is updated the next time the pending RPC completes. Because
+        the actor processes calls in FIFO order, the result always reflects
+        state after all previously submitted ``request_resources`` calls to the
+        same actor.
+
+        On actor errors, returns the cached value and logs a warning; never
+        raises. ``pending_attr``/``cached_attr`` name the per-getter instance
+        attributes holding the in-flight ref and the last result respectively.
+        """
+        ref = getattr(self, pending_attr)
+        if ref is not None:
+            ready, _ = ray.wait([ref], timeout=0)
+            if ready:
+                setattr(self, pending_attr, None)
+                try:
+                    setattr(self, cached_attr, ray.get(ref, timeout=0))
+                except ray.exceptions.RayError:
+                    logger.warning(
+                        f"Failed to get {label} for {self._requester_id};"
+                        " falling back to the cached value."
+                        " If this persists, file a GitHub issue.",
+                        exc_info=RAY_DATA_AUTOSCALING_COORDINATOR_LOG_TRACEBACK,
+                    )
+
+        # Submit a new request if none is currently in-flight
+        # (first call, or the previous request completed or errored).
+        if getattr(self, pending_attr) is None:
+            setattr(self, pending_attr, remote_method.remote(self._requester_id))
+
+        return getattr(self, cached_attr)
+
     def get_reserved_resources(self) -> List[ResourceDict]:
-        """Return reserved resources without blocking.
+        """Return allocated resources without blocking.
 
         Submits an async RPC and immediately returns the last cached result.
         The cache is updated the next time the pending RPC completes.
@@ -224,31 +273,25 @@ class DefaultAutoscalingCoordinator(AutoscalingCoordinator):
 
         On actor errors, returns the cached value and logs a warning; never raises.
         """
-        ref = self._pending_reserved_resources
-        if ref is not None:
-            ready, _ = ray.wait([ref], timeout=0)
-            if ready:
-                self._pending_reserved_resources = None
-                try:
-                    self._cached_reserved_resources = ray.get(ref, timeout=0)
-                except ray.exceptions.RayError:
-                    logger.warning(
-                        f"Failed to get reserved resources for {self._requester_id};"
-                        " falling back to the cached value."
-                        " If this persists, file a GitHub issue.",
-                        exc_info=RAY_DATA_AUTOSCALING_COORDINATOR_LOG_TRACEBACK,
-                    )
+        return self._poll_cached(
+            "_pending_reserved_resources",
+            "_cached_reserved_resources",
+            self._autoscaling_coordinator.get_reserved_resources,
+            "allocated resources",
+        )
 
-        # Submit a new request if none is currently in-flight
-        # (first call, or the previous request completed or errored).
-        if self._pending_reserved_resources is None:
-            self._pending_reserved_resources = (
-                self._autoscaling_coordinator.get_reserved_resources.remote(
-                    self._requester_id,
-                )
-            )
+    def get_reserved_resources_by_node(self) -> Dict[str, ResourceDict]:
+        """Return Dict of nodeId to allocated resources, without blocking.
 
-        return self._cached_reserved_resources
+        Same non-blocking cached pattern as ``get_reserved_resources``: submits
+        an async RPC and immediately returns the last cached result.
+        """
+        return self._poll_cached(
+            "_pending_reserved_resources_by_node",
+            "_cached_reserved_resources_by_node",
+            self._autoscaling_coordinator.get_reserved_resources_by_node,
+            "per-node allocated resources",
+        )
 
 
 def _default_send_resources_request(
@@ -286,10 +329,11 @@ class _AutoscalingCoordinatorActor:
         self._ongoing_reqs: Dict[RequesterId, OngoingRequest] = {}
         # Map from requester id to its subcluster selector.
         self._subcluster_selectors: Dict[RequesterId, Optional[LabelSelector]] = {}
-        # Node resources bucketed by their ``SUBCLUSTER_LABEL_KEY`` value.
-        # Nodes without the key fall under ``DEFAULT_SUBCLUSTER``.
+        # Node resources bucketed by their ``SUBCLUSTER_LABEL_KEY`` value
+        # Nodes without the key fall under ``DEFAULT_SUBCLUSTER``. Each value (list) entry
+        # is a ``(node_id, resources)`` tuple.
         self._cluster_node_resources: Dict[
-            Optional[LabelValue], List[ResourceDict]
+            Optional[LabelValue], List[Tuple[str, ResourceDict]]
         ] = {}
         # Lock for thread-safe access to shared state from the background
         self._lock = threading.Lock()
@@ -455,6 +499,19 @@ class _AutoscalingCoordinatorActor:
                 return []
             return self._ongoing_reqs[requester_id].reserved_resources
 
+    def get_reserved_resources_by_node(
+        self, requester_id: str
+    ) -> Dict[str, ResourceDict]:
+        """Return a dict of nodeId to allocated resources for the requester.
+
+        Same allocation as ``get_reserved_resources``, with bundles merged
+        per node they were bin-packed onto.
+        """
+        with self._lock:
+            if requester_id not in self._ongoing_reqs:
+                return {}
+            return self._ongoing_reqs[requester_id].reserved_by_node
+
     def _maybe_subtract_resources(self, res1: ResourceDict, res2: ResourceDict) -> bool:
         """If res2<=res1, subtract res2 from res1 in-place, and return True.
         Otherwise return False."""
@@ -483,17 +540,31 @@ class _AutoscalingCoordinatorActor:
 
         nodes = list(filter(_is_node_eligible, self._get_cluster_nodes()))
         nodes = sorted(nodes, key=lambda node: node.get("NodeID", ""))
-        cluster_node_resources: Dict[Optional[LabelValue], List[ResourceDict]] = {}
+        # Bucket nodes by subcluster, keeping (node_id, resources) per node so
+        # allocation can attribute usage back to specific nodes. Comparing the
+        # (node_id, resources) tuples also refreshes when a node swap leaves the
+        # resource shapes identical.
+        cluster_node_resources: Dict[
+            Optional[LabelValue], List[Tuple[str, ResourceDict]]
+        ] = {}
         for node in nodes:
             # Safeguard against case where the value of Labels is None.
             labels = node.get("Labels") or {}
             subcluster = labels.get(SUBCLUSTER_LABEL_KEY, DEFAULT_SUBCLUSTER)
-            cluster_node_resources.setdefault(subcluster, []).append(node["Resources"])
+            cluster_node_resources.setdefault(subcluster, []).append(
+                (node.get("NodeID", ""), node["Resources"])
+            )
         if cluster_node_resources == self._cluster_node_resources:
             return False
         logger.debug("Cluster resources updated: %s.", cluster_node_resources)
         self._cluster_node_resources = cluster_node_resources
         return True
+
+    @staticmethod
+    def _merge_resources_into(target: ResourceDict, resources: ResourceDict) -> None:
+        """Merge ``resources`` into ``target`` in-place, summing values per key."""
+        for key, value in resources.items():
+            target[key] = target.get(key, 0) + value
 
     def _rereserve_resources(self):
         """Rereserve cluster resources.
@@ -503,7 +574,7 @@ class _AutoscalingCoordinatorActor:
         """
         now = self._get_current_time()
         cluster_node_resources: Dict[
-            Optional[LabelValue], List[ResourceDict]
+            Optional[LabelValue], List[Tuple[str, ResourceDict]]
         ] = copy.deepcopy(self._cluster_node_resources)
         live_items = [
             (req_id, req)
@@ -519,11 +590,19 @@ class _AutoscalingCoordinatorActor:
         # TODO(hchen): Optimize the following triple loop.
         for requester_id, ongoing_req in live_items:
             ongoing_req.reserved_resources = []
+            # Re-derive per-node attribution from scratch each pass.
+            ongoing_req.reserved_by_node = {}
             subcluster = _subcluster_of(requester_id)
             for bundle in ongoing_req.requested_resources:
-                for node_resource in cluster_node_resources.get(subcluster, []):
+                for node_id, node_resource in cluster_node_resources.get(
+                    subcluster, []
+                ):
                     if self._maybe_subtract_resources(node_resource, bundle):
                         ongoing_req.reserved_resources.append(bundle)
+                        self._merge_resources_into(
+                            ongoing_req.reserved_by_node.setdefault(node_id, {}),
+                            bundle,
+                        )
                         break
 
         # Reserve remaining resources. Multiple concurrent requesters in
@@ -539,13 +618,16 @@ class _AutoscalingCoordinatorActor:
             ]
             if not eligible:
                 continue
-            for node_resource in node_resources:
-                # Integer division may leave some resources unreserved.
+            for node_id, node_resource in node_resources:
+                # Integer division may leave some resources unallocated.
                 divided = {k: v // len(eligible) for k, v in node_resource.items()}
                 if not any(v > 0 for v in divided.values()):
                     continue
                 for r in eligible:
                     r.reserved_resources.append(divided)
+                    self._merge_resources_into(
+                        r.reserved_by_node.setdefault(node_id, {}), divided
+                    )
 
         if logger.isEnabledFor(logging.DEBUG):
             msg = "Reserved resources:\n"
@@ -560,13 +642,18 @@ class _AutoscalingCoordinatorActor:
 _get_or_create_lock = threading.Lock()
 
 
+def _coordinator_scheduling_strategy(node_id: str) -> NodeAffinitySchedulingStrategy:
+    """Prefer the calling node (reduces network overhead) without hard-pinning:
+    the coordinator is detached with max_restarts=-1, so a soft=False pin to a
+    node that later dies would make every restart attempt raise
+    ActorUnschedulableError to all callers, forever."""
+    return NodeAffinitySchedulingStrategy(node_id, soft=True)
+
+
 def get_or_create_autoscaling_coordinator():
     """Get or create the AutoscalingCoordinator actor."""
-    # Create the actor on the local node,
-    # to reduce network overhead.
-    scheduling_strategy = NodeAffinitySchedulingStrategy(
-        ray.get_runtime_context().get_node_id(),
-        soft=False,
+    scheduling_strategy = _coordinator_scheduling_strategy(
+        ray.get_runtime_context().get_node_id()
     )
     actor_cls = ray.remote(num_cpus=0, max_restarts=-1, max_task_retries=-1)(
         _AutoscalingCoordinatorActor

@@ -241,6 +241,51 @@ def test_high_memory_detection(
     assert should_return_issue == bool(issues)
 
 
+def test_high_memory_detector_does_not_invoke_ray_remote_args_fn(
+    restore_data_context,
+):
+    """The detector must read an operator's memory footprint without invoking
+    its ``ray_remote_args_fn``.
+
+    Some fns (e.g. the vLLM engine's Ray placement-group fn) mint a real
+    placement group as a side effect on every call. Invoking one for inspection
+    leaks an orphan placement group that can win the race for the node's GPUs and
+    starve the operator's real actor. The detector only needs the ``memory``
+    value, which the fn does not supply for such ops.
+    """
+    ctx = DataContext.get_current()
+
+    call_count = 0
+
+    def counting_ray_remote_args_fn():
+        nonlocal call_count
+        call_count += 1
+        return {"scheduling_strategy": "SPREAD"}
+
+    input_data_buffer = InputDataBuffer(ctx, input_data=[])
+    map_operator = MapOperator.create(
+        map_transformer=MagicMock(),
+        input_op=input_data_buffer,
+        data_context=ctx,
+        ray_remote_args={"memory": 8 * GiB},
+        ray_remote_args_fn=counting_ray_remote_args_fn,
+    )
+    map_operator._metrics = MagicMock(average_max_uss_per_task=8 * GiB)
+
+    detector = HighMemoryIssueDetector(
+        dataset_id="id",
+        operators=[map_operator],
+        config=ctx.issue_detectors_config.high_memory_detector_config,
+    )
+    detector.detect()
+
+    assert call_count == 0, (
+        "HighMemoryIssueDetector must not invoke ray_remote_args_fn "
+        f"(invoked it {call_count} times); the fn may mint a placement group "
+        "as a side effect."
+    )
+
+
 if __name__ == "__main__":
     import sys
 

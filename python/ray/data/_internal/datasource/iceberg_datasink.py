@@ -770,6 +770,17 @@ class IcebergDatasink(Datasink[IcebergWriteResult]):
         """
         from pyiceberg.io.pyarrow import _dataframe_to_data_files
 
+        # Table state (`_table`, `_io`, `_table_metadata`) is populated by
+        # `on_write_start`, which runs on the driver. It normally reaches the
+        # workers because the map transformer is serialized after `on_write_start`
+        # mutates it. Under the actor-only backend, however, the Write op's
+        # actors are created eagerly (before the first input / `on_write_start`),
+        # so this datasink instance can arrive on a worker with no table state.
+        # Lazily load it once here; the driver's `on_write_start` has already
+        # committed any schema evolution, so the reloaded metadata reflects it.
+        if self._table_metadata is None:
+            self._reload_table()
+
         all_data_files = []
         upsert_keys_tables = []
         block_schemas = []

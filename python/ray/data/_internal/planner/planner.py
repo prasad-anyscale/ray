@@ -95,10 +95,12 @@ def plan_input_data_op(
     """Get the corresponding DAG of physical operators for InputData."""
     assert len(physical_children) == 0
 
-    return InputDataBuffer(
+    input_data_buffer = InputDataBuffer(
         data_context,
         input_data=logical_op.input_data,
     )
+
+    return input_data_buffer
 
 
 def plan_from_op(
@@ -107,7 +109,10 @@ def plan_from_op(
     data_context: DataContext,
 ) -> PhysicalOperator:
     assert len(physical_children) == 0
-    return InputDataBuffer(data_context, op.input_data)
+
+    input_data_buffer = InputDataBuffer(data_context, op.input_data)
+
+    return input_data_buffer
 
 
 def plan_zip_op(_, physical_children, data_context):

@@ -72,6 +72,27 @@ def test_shuffle_config_factory_returns_config_when_seeded(tmp_path):
     assert config.seed == 42
 
 
+def test_listing_task_count_caps_listfiles_pool():
+    # ListFiles is capped at the listing-block count (one worker per block), not
+    # the sizer's equal share. maybe_promote_compute_strategy turns this into a
+    # fixed ActorPoolStrategy(size=N) under the actor-only backend.
+    from ray.data._internal.planner.plan_list_files_op import (
+        DEFAULT_MAX_NUM_LIST_FILES_TASKS,
+        _num_listing_tasks,
+    )
+
+    assert _num_listing_tasks(1, should_parallelize=True) == 1  # single prefix
+    assert _num_listing_tasks(3, should_parallelize=True) == 3
+    # capped at the max even for many explicit paths
+    assert (
+        _num_listing_tasks(1000, should_parallelize=True)
+        == DEFAULT_MAX_NUM_LIST_FILES_TASKS
+    )
+    # shuffle (one global listing task) and empty paths -> 1
+    assert _num_listing_tasks(50, should_parallelize=False) == 1
+    assert _num_listing_tasks(0, should_parallelize=True) == 1
+
+
 if __name__ == "__main__":
     import sys
 

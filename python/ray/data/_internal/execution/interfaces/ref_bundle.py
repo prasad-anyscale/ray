@@ -219,6 +219,8 @@ class RefBundle:
         Returns:
             Dict mapping node ID to total bytes stored on that node
         """
+        # TODO(Justin): I don't think we need this at all.
+
         meta = self._get_cached_metadata()
 
         if self._cached_preferred_locations is None:
@@ -233,6 +235,20 @@ class RefBundle:
             object.__setattr__(self, "_cached_preferred_locations", preferred_locs)
 
         return self._cached_preferred_locations
+
+    def get_preferred_object_locations_from_metadata(self) -> Dict[NodeIdStr, int]:
+        """Returns a mapping of node IDs to total bytes stored on each node.
+
+        Returns:
+            Dict mapping node ID to total bytes stored on that node
+        """
+        preferred_locations = {}
+        for bm in self.metadata:
+            if bm.exec_stats is not None:
+                preferred_locations.setdefault(bm.exec_stats.node_id, 0)
+                preferred_locations[bm.exec_stats.node_id] += bm.size_bytes
+
+        return preferred_locations
 
     def _get_cached_metadata(self) -> Dict[ObjectRef, "_ObjectMetadata"]:
         if self._cached_object_meta is None:

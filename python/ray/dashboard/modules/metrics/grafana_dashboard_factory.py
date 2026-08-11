@@ -295,6 +295,7 @@ def _generate_panel_template(
         PanelTemplate.HEATMAP,
         PanelTemplate.PIE_CHART,
         PanelTemplate.BAR_CHART,
+        PanelTemplate.TIME_SERIES_BAR_CHART,
         PanelTemplate.TABLE,
         PanelTemplate.GRAPH,
     ):
@@ -319,6 +320,10 @@ def _generate_panel_template(
             template["fieldConfig"]["defaults"]["thresholds"][
                 "steps"
             ] = panel.thresholds
+
+    # Per-series fieldConfig overrides (for panels with fieldConfig.overrides)
+    if panel.field_config_overrides is not None and "fieldConfig" in template:
+        template["fieldConfig"]["overrides"] = panel.field_config_overrides
 
     # Value mappings (for panels with fieldConfig.defaults.mappings)
     if panel.value_mappings is not None:
@@ -399,7 +404,19 @@ def _generate_panel_template(
             }
         ]
 
+    if panel.template_overrides is not None:
+        _deep_merge(template, panel.template_overrides)
+
     return template
+
+
+def _deep_merge(base: dict, overrides: dict) -> None:
+    """Merges overrides into base in place; nested dicts merge, other values replace."""
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
 
 
 def _create_row_panel(row: Panel, y_position: int) -> dict:
@@ -551,5 +568,7 @@ def _generate_targets(panel: Panel, panel_global_filters: List[str]) -> List[dic
                 "refId": ref_id,
             }
         )
+        if target.interval is not None:
+            template["interval"] = target.interval
         targets.append(template)
     return targets

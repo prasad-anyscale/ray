@@ -313,6 +313,37 @@ DEFAULT_WAIT_FOR_MIN_ACTORS_S = env_integer(
     "RAY_DATA_DEFAULT_WAIT_FOR_MIN_ACTORS_S", -1
 )
 
+# Defaults used when ``wait_for_min_actors_s`` is unset (<= 0) and the
+# actor-only backend is enabled: block execution until every operator's
+# initial (min) actors are up.
+#
+# A single fixed deadline fits pool sizes badly: 5 minutes is generous for a
+# 2-actor pool and too tight for a 100-actor pool that has to autoscale in
+# several nodes. So the budget scales with how many actors we're waiting on:
+#
+#   budget = min(BASE + PER_ACTOR * num_pending, MAX)
+#
+# and, independently, the wait aborts early if *no* actor becomes ready for
+# ``STALL`` seconds. Progress -- not wall-clock alone -- is what says the
+# cluster is still working on us: a genuinely wedged pool (no capacity, bad
+# image, unschedulable resource shape) fails in ~STALL regardless of size,
+# while a large pool that keeps starting actors keeps its full budget.
+#
+# Set RAY_DATA_DEFAULT_WAIT_FOR_MIN_ACTORS_S to opt out of all of this and use
+# one explicit deadline instead.
+DEFAULT_WAIT_FOR_MIN_ACTORS_ACTOR_ONLY_S = env_integer(
+    "RAY_DATA_WAIT_FOR_MIN_ACTORS_BASE_S", 300
+)
+DEFAULT_WAIT_FOR_MIN_ACTORS_PER_ACTOR_S = env_integer(
+    "RAY_DATA_WAIT_FOR_MIN_ACTORS_PER_ACTOR_S", 15
+)
+DEFAULT_WAIT_FOR_MIN_ACTORS_MAX_S = env_integer(
+    "RAY_DATA_WAIT_FOR_MIN_ACTORS_MAX_S", 1800
+)
+DEFAULT_WAIT_FOR_MIN_ACTORS_STALL_S = env_integer(
+    "RAY_DATA_WAIT_FOR_MIN_ACTORS_STALL_S", 300
+)
+
 DEFAULT_ACTOR_MAX_TASKS_IN_FLIGHT_TO_MAX_CONCURRENCY_FACTOR = env_integer(
     "RAY_DATA_ACTOR_DEFAULT_MAX_TASKS_IN_FLIGHT_TO_MAX_CONCURRENCY_FACTOR", 2
 )
@@ -703,7 +734,11 @@ class DataContext:
         s3_try_create_dir: If ``True``, try to create directories on S3 when a write
             call is made with a S3 URI.
         wait_for_min_actors_s: The default time to wait for minimum requested
-            actors to start before raising a timeout, in seconds.
+            actors to start before raising a timeout, in seconds. When unset
+            (<= 0) and the actor-only backend is enabled, the wait budget is
+            derived from the number of actors being waited on (see
+            ``DEFAULT_WAIT_FOR_MIN_ACTORS_ACTOR_ONLY_S`` and friends) and the
+            wait also aborts early when actor startup stalls.
         max_tasks_in_flight_per_actor: Max number of tasks that could be submitted
             for execution to individual actor at the same time. Note that only up to
             `max_concurrency` number of these tasks will be executing concurrently
@@ -1036,6 +1071,12 @@ class DataContext:
         self._max_num_blocks_in_streaming_gen_buffer = (
             DEFAULT_MAX_NUM_BLOCKS_IN_STREAMING_GEN_BUFFER
         )
+
+        # When True, map actor tasks yield block + metadata as one grouped
+        # streaming-generator tuple (``_num_objects_per_yield=2``). Set by the
+        # actor pool operator on the driver and propagated to workers via the
+        # serialized DataContext ref.
+        self._use_grouped_streaming_generator_yields = False
 
         # Unique id of the current execution of the data pipeline.
         # This value increments only upon re-execution of the exact same pipeline.

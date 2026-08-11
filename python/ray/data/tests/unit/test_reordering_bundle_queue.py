@@ -312,6 +312,23 @@ def test_ordered_queue_finalize_out_of_order():
     assert queue.get_next() is bundle2
 
 
+def test_ordered_queue_get_next_with_key():
+    """get_next_with_key returns each bundle with its (current) key, in order.
+
+    (Used by the actor-only backend to attribute a consumed bundle to its
+    producing actor via the operator's task->actor table.)
+    """
+    queue = ReorderingBundleQueue()
+    bundle0 = _create_bundle("a")
+    bundle1 = _create_bundle("b")
+    queue.add(bundle0, key=0)
+    queue.add(bundle1, key=1)
+
+    assert queue.get_next_with_key() == (bundle0, 0)
+    queue.finalize(key=0)
+    assert queue.get_next_with_key() == (bundle1, 1)
+
+
 if __name__ == "__main__":
     import sys
 

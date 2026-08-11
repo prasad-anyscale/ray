@@ -11,7 +11,9 @@ from ray.data._internal.execution.interfaces import (
 )
 from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
-from ray.data._internal.execution.operators.map_operator import MapOperator
+from ray.data._internal.execution.operators.map_operator import (
+    MapOperator,
+)
 from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
     MapTransformer,
@@ -20,7 +22,7 @@ from ray.data._internal.execution.util import memory_string
 from ray.data._internal.logical.operators import Read
 from ray.data._internal.output_buffer import OutputBlockSizeOption
 from ray.data._internal.util import _warn_on_high_parallelism
-from ray.data.block import Block, BlockMetadata
+from ray.data.block import Block, BlockExecStats, BlockMetadata
 from ray.data.context import DataContext
 from ray.data.datasource.datasource import ReadTask
 from ray.experimental.locations import get_local_object_locations
@@ -52,7 +54,7 @@ def _derive_metadata(read_task: ReadTask, read_task_ref: ObjectRef) -> BlockMeta
     return BlockMetadata(
         num_rows=1,
         size_bytes=task_size,
-        exec_stats=None,
+        exec_stats=BlockExecStats(),
         input_files=None,
     )
 
@@ -69,7 +71,9 @@ def plan_read_op(
     """
     assert len(physical_children) == 0
 
-    def get_input_data(target_max_block_size) -> List[RefBundle]:
+    def get_input_data(
+        self: PhysicalOperator, target_max_block_size: int
+    ) -> List[RefBundle]:
         parallelism = op.get_detected_parallelism()
         assert (
             parallelism is not None
@@ -85,15 +89,16 @@ def plan_read_op(
         _warn_on_high_parallelism(parallelism, len(read_tasks))
 
         ret = []
-        for read_task in read_tasks:
+        for i, read_task in enumerate(read_tasks):
             read_task_ref = ray.put(read_task)
+            metadata = _derive_metadata(read_task, read_task_ref)
             ref_bundle = RefBundle(
                 (
                     BlockEntry(
                         # TODO: figure out a better way to pass read
                         # tasks other than ray.put().
                         read_task_ref,
-                        _derive_metadata(read_task, read_task_ref),
+                        metadata,
                     ),
                 ),
                 # `owns_blocks` is False, because these refs are the root of the
@@ -124,7 +129,7 @@ def plan_read_op(
         ]
     )
 
-    return MapOperator.create(
+    read_op = MapOperator.create(
         map_transformer,
         inputs,
         data_context,
@@ -132,4 +137,6 @@ def plan_read_op(
         compute_strategy=op.compute,
         ray_remote_args=op.ray_remote_args,
         isolate_workers=data_context.isolate_read_workers,
+        is_read_op=True,
     )
+    return read_op

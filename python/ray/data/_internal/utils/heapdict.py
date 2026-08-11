@@ -34,12 +34,8 @@ This is a copy of the heapdict library to avoid external dependencies.
 Original source: https://pypi.org/project/HeapDict/
 """
 
-from typing import Generic, TypeVar
-
-try:
-    from collections.abc import MutableMapping
-except ImportError:
-    from collections import MutableMapping
+from collections.abc import MutableMapping
+from typing import Iterator, Tuple, TypeVar
 
 KT = TypeVar("KT")
 VT = TypeVar("VT")
@@ -56,7 +52,7 @@ def doc(s):
     return f
 
 
-class heapdict(MutableMapping, Generic[KT, VT]):
+class heapdict(MutableMapping[KT, VT]):
     __marker = object()
 
     def __init__(self, *args, **kw):
@@ -70,7 +66,7 @@ class heapdict(MutableMapping, Generic[KT, VT]):
         self.d.clear()
 
     @doc(dict.__setitem__)
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: KT, value: VT) -> None:
         if key in self.d:
             self.pop(key)
         wrapper = [value, key, len(self)]
@@ -115,7 +111,7 @@ class heapdict(MutableMapping, Generic[KT, VT]):
         h[j][2] = j
 
     @doc(dict.__delitem__)
-    def __delitem__(self, key):
+    def __delitem__(self, key: KT) -> None:
         wrapper = self.d[key]
         while wrapper[2]:
             # calculate the offset of the parent
@@ -125,14 +121,14 @@ class heapdict(MutableMapping, Generic[KT, VT]):
         self.popitem()
 
     @doc(dict.__getitem__)
-    def __getitem__(self, key):
+    def __getitem__(self, key: KT) -> VT:
         return self.d[key][0]
 
     @doc(dict.__iter__)
-    def __iter__(self):
+    def __iter__(self) -> Iterator[KT]:
         return iter(self.d)
 
-    def popitem(self):
+    def popitem(self) -> Tuple[KT, VT]:
         """D.popitem() -> (k, v), remove and return the (key, value) pair with lowest\nvalue; but raise KeyError if D is empty."""
         wrapper = self.heap[0]
         if len(self.heap) == 1:
@@ -145,10 +141,10 @@ class heapdict(MutableMapping, Generic[KT, VT]):
         return wrapper[1], wrapper[0]
 
     @doc(dict.__len__)
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.d)
 
-    def peekitem(self):
+    def peekitem(self) -> Tuple[KT, VT]:
         """D.peekitem() -> (k, v), return the (key, value) pair with lowest value;\n but raise KeyError if D is empty."""
         return (self.heap[0][1], self.heap[0][0])
 

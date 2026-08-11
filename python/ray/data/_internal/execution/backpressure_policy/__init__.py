@@ -15,8 +15,8 @@ if TYPE_CHECKING:
 # Default enabled backpressure policies and its config key.
 # Use `DataContext.set_config` to config it.
 ENABLED_BACKPRESSURE_POLICIES = [
-    ConcurrencyCapBackpressurePolicy,
     ResourceBudgetBackpressurePolicy,
+    ConcurrencyCapBackpressurePolicy,
     DownstreamCapacityBackpressurePolicy,
 ]
 ENABLED_BACKPRESSURE_POLICIES_CONFIG_KEY = "backpressure_policies.enabled"

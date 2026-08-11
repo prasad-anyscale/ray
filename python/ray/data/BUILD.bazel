@@ -105,6 +105,26 @@ py_test_module_list(
     ],
 )
 
+# Integration tests for the actor-only backend (RAY_DATA_ACTOR_ONLY_BACKEND=1).
+# Unlike tests/unit, these spin up a real Ray cluster, so they live in their
+# own directory rather than under the unit conftest (which forbids ray.init).
+py_test_module_list(
+    size = "medium",
+    env = {
+        "RAY_DATA_ACTOR_ONLY_BACKEND": "1",
+        "RAY_DATA_ENABLE_CORE_ACTOR_BACKPRESSURE": "1",
+    },
+    files = glob(["tests/actor_only/test_*.py"]),
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
 py_test(
     name = "test_arrow",
     size = "small",
@@ -123,6 +143,20 @@ py_test(
     name = "test_strict_mode",
     size = "small",
     srcs = ["tests/test_strict_mode.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_cache",
+    size = "small",
+    srcs = ["tests/test_cache.py"],
     tags = [
         "exclusive",
         "team:data",

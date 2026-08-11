@@ -61,3 +61,11 @@ class AutoscalingCoordinator(abc.ABC):
             A list of dictionaries representing the reserved resources bundles.
         """
         ...
+
+    def get_reserved_resources_by_node(self) -> Dict[str, ResourceDict]:
+        """Get the allocated resources for the requester, keyed by node id..
+
+        Returns:
+            A mapping from node id to the resources allocated on that node.
+        """
+        raise NotImplementedError

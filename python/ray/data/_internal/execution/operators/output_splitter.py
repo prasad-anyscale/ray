@@ -32,6 +32,9 @@ from ray.data.block import Block, BlockAccessor, BlockMetadata
 from ray.data.context import DataContext
 from ray.types import ObjectRef
 
+if TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_SPLITTER_MAX_BUFFERING_FACTOR = env_float(
@@ -118,6 +121,12 @@ class OutputSplitter(InternalQueueOperatorMixin, PhysicalOperator):
     def _output_queues(self) -> List["BaseBundleQueue"]:
         return [self._output_queue]
 
+    @override
+    def min_num_rows_needed_to_make_progress(self) -> int:
+        if self._equal:
+            return self.num_output_splits()
+        return 0
+
     def num_outputs_total(self) -> Optional[int]:
         # OutputSplitter does not change the number of blocks,
         # so we can return the number of blocks from the input op.
@@ -131,13 +140,14 @@ class OutputSplitter(InternalQueueOperatorMixin, PhysicalOperator):
         self,
         options: ExecutionOptions,
         block_ref_counter: "BlockRefCounter",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
         if options.preserve_order:
             # If preserve_order is set, we need to ignore locality hints to ensure determinism.
             self._locality_hints = None
             self._max_buffer_size = 0
 
-        super().start(options, block_ref_counter)
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
 
     def throttling_disabled(self) -> bool:
         """Disables resource-based throttling.

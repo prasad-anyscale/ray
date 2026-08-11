@@ -67,6 +67,7 @@ from ray.data._internal.datasource.video_datasource import VideoDatasource
 from ray.data._internal.datasource.webdataset_datasource import WebDatasetDatasource
 from ray.data._internal.datasource.zarrv2_datasource import ZarrV2Datasource
 from ray.data._internal.delegating_block_builder import DelegatingBlockBuilder
+from ray.data._internal.execution.execution_flags import ENABLE_OPERATOR_SIZER
 from ray.data._internal.logical.interfaces import LogicalPlan
 from ray.data._internal.logical.operators import (
     FromArrow,
@@ -160,7 +161,12 @@ def from_blocks(blocks: List[Block]):
         A :class:`~ray.data.Dataset` holding the blocks.
     """
     block_refs = [ray.put(block) for block in blocks]
-    meta_with_schema = [BlockMetadataWithSchema.from_block(block) for block in blocks]
+    meta_with_schema = [
+        BlockMetadataWithSchema.from_block(
+            block, block_exec_stats=BlockExecStats.builder().build()
+        )
+        for block in blocks
+    ]
 
     from_blocks_op = FromBlocks(block_refs, meta_with_schema)
     stats = DatasetStats(metadata={"FromBlocks": meta_with_schema}, parent=None)
@@ -416,8 +422,10 @@ def _resolve_read_remote_args(
         ] = ray.get_runtime_context().get_node_id()
         ray_remote_args["label_selector"] = label_selector
         ray_remote_args.pop("scheduling_strategy", None)
+    # The operator sizer owns actor placement so we skip setting it here.
     if (
-        "scheduling_strategy" not in ray_remote_args
+        not ENABLE_OPERATOR_SIZER
+        and "scheduling_strategy" not in ray_remote_args
         and "label_selector" not in ray_remote_args
     ):
         ray_remote_args["scheduling_strategy"] = ctx.scheduling_strategy

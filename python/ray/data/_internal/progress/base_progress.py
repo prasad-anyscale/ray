@@ -9,6 +9,7 @@ from ray.data._internal.execution.operators.sub_progress import SubProgressBarMi
 from ray.data._internal.progress.utils import truncate_operator_name
 
 if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
     from ray.data._internal.execution.resource_manager import ResourceManager
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
     from ray.types import ObjectRef
@@ -181,13 +182,20 @@ class BaseExecutionProgressManager(ABC):
 
     @abstractmethod
     def update_operator_progress(
-        self, opstate: "OpState", resource_manager: "ResourceManager"
+        self,
+        opstate: "OpState",
+        resource_manager: "ResourceManager",
+        extra_summary: str = "",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
         """Update individual operator progress.
 
         Args:
             opstate: opstate of the operator.
             resource_manager: the ResourceManager.
+            extra_summary: optional extra status to append to the operator summary.
+            resource_bank: when set, use live object-store accounting from the
+                ResourceBank instead of the ResourceManager's estimate.
         """
         ...
 
@@ -253,6 +261,10 @@ class NoopExecutionProgressManager(BaseExecutionProgressManager):
         pass
 
     def update_operator_progress(
-        self, opstate: "OpState", resource_manager: "ResourceManager"
+        self,
+        opstate: "OpState",
+        resource_manager: "ResourceManager",
+        extra_summary: str = "",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
         pass

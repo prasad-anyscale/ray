@@ -1,6 +1,9 @@
+import os
+
 import pytest
 
 import ray
+from ray._common.test_utils import run_string_as_driver
 from ray.util.annotations import RayDeprecationWarning
 
 
@@ -49,6 +52,26 @@ def test_data_context_current_context_manager():
             raise ValueError("boom")
 
     assert DataContext.get_current() is original
+
+
+@pytest.mark.parametrize(
+    "env_value,expected",
+    [(None, "False"), ("0", "False"), ("1", "True")],
+)
+def test_use_datasource_v2_env_var(env_value, expected):
+    """``DataContext.use_datasource_v2`` defaults from the
+    ``RAY_DATA_USE_DATASOURCE_V2`` environment variable (default off).
+
+    The default is read at import time, so check it in a subprocess.
+    """
+    script = (
+        "from ray.data.context import DataContext\n"
+        "print(DataContext.get_current().use_datasource_v2)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "RAY_DATA_USE_DATASOURCE_V2"}
+    if env_value is not None:
+        env["RAY_DATA_USE_DATASOURCE_V2"] = env_value
+    assert run_string_as_driver(script, env=env).strip().splitlines()[-1] == expected
 
 
 if __name__ == "__main__":

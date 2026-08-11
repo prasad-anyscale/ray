@@ -493,6 +493,19 @@ class _StatsActor:
         # Per Node metrics
         self.per_node_metrics = self._create_prometheus_metrics_for_per_node_metrics()
 
+        # OperatorSizer (actor-only backend) tick-duration telemetry. Per-phase
+        # control-loop wall time, keyed by (dataset, phase) -- not per-operator,
+        # so it stays here rather than in OpRuntimeMetrics. (Per-operator actor
+        # churn is on OpRuntimeMetrics; see OperatorSizer.record_tick.)
+        self.sizer_tick_duration_s = Gauge(
+            "data_sizer_tick_duration_s",
+            description="OperatorSizer per-phase tick wall time in seconds "
+            "(phase=optimize|how_many|where|apply|e2e). e2e spans the whole "
+            "scheduling-loop step, so it also covers non-sizer work and the "
+            "named phases do not sum to it.",
+            tag_keys=("dataset", "phase"),
+        )
+
         iter_tag_keys = ("dataset", "split")
 
         self.time_to_first_batch_s = Gauge(
@@ -855,6 +868,20 @@ class _StatsActor:
         self.iter_rows_total.set(stats.iter_rows_total, tags)
         self.iter_user_s.set(stats.iter_user_s.get(), tags)
 
+    def update_sizer_metrics(
+        self,
+        dataset_tag: str,
+        tick_durations: Dict[str, float],
+    ):
+        """Update OperatorSizer per-phase tick-duration gauges. ``tick_durations``
+        maps phase name (optimize|how_many|where|apply|e2e) to seconds. Per-operator
+        actor churn is on OpRuntimeMetrics (see OperatorSizer.record_tick), exported
+        via the standard execution-metrics push."""
+        for phase, seconds in tick_durations.items():
+            self.sizer_tick_duration_s.set(
+                seconds, tags={"dataset": dataset_tag, "phase": phase}
+            )
+
     def register_dataset(
         self,
         job_id: str,
@@ -1151,6 +1178,21 @@ class _StatsManager:
         except Exception as e:
             logger.warning(
                 f"Error occurred during update_iteration_metrics.remote call to _StatsActor: {e}",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def update_sizer_metrics(
+        dataset_tag: str,
+        tick_durations: Dict[str, float],
+    ):
+        try:
+            get_or_create_stats_actor().update_sizer_metrics.remote(
+                dataset_tag, tick_durations
+            )
+        except Exception as e:
+            logger.warning(
+                f"Error occurred during update_sizer_metrics.remote call to _StatsActor: {e}",
                 exc_info=True,
             )
 

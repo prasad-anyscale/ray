@@ -304,6 +304,58 @@ def test_local_paths(ray_start_regular_shared, tmp_path):
     assert not datasource.supports_distributed_reads
 
 
+def test_resolve_read_remote_args_sizer_skips_default_scheduling_strategy(
+    ray_start_regular_shared, tmp_path, monkeypatch
+):
+    """With the operator sizer enabled, the SPREAD default scheduling_strategy
+    is NOT set (the sizer owns placement and rejects a user/default strategy);
+    with it disabled, the default is applied as before."""
+    import ray.data.read_api as read_api
+
+    path = os.path.join(tmp_path, "test.txt")
+    with open(path, "w"):
+        pass
+    ctx = ray.data.DataContext.get_current()
+
+    # Distributed read, sizer OFF -> default scheduling_strategy applied.
+    monkeypatch.setattr(read_api, "ENABLE_OPERATOR_SIZER", False)
+    args = read_api._resolve_read_remote_args(
+        MockFileBasedDatasource(path), None, None, None, None, ctx
+    )
+    assert args["scheduling_strategy"] == ctx.scheduling_strategy
+    assert "label_selector" not in args
+
+    # Distributed read, sizer ON -> no scheduling_strategy (sizer places).
+    monkeypatch.setattr(read_api, "ENABLE_OPERATOR_SIZER", True)
+    args = read_api._resolve_read_remote_args(
+        MockFileBasedDatasource(path), None, None, None, None, ctx
+    )
+    assert "scheduling_strategy" not in args
+    assert "label_selector" not in args
+
+
+def test_resolve_read_remote_args_local_read_keeps_label_selector(
+    ray_start_regular_shared, tmp_path, monkeypatch
+):
+    """Local-scheme reads pin to the driver via a node-id label_selector and
+    drop scheduling_strategy, regardless of the sizer flag."""
+    import ray.data.read_api as read_api
+
+    path = os.path.join(tmp_path, "test.txt")
+    with open(path, "w"):
+        pass
+    ctx = ray.data.DataContext.get_current()
+    node_id_key = ray._raylet.RAY_NODE_ID_KEY
+
+    for sizer_enabled in (False, True):
+        monkeypatch.setattr(read_api, "ENABLE_OPERATOR_SIZER", sizer_enabled)
+        args = read_api._resolve_read_remote_args(
+            MockFileBasedDatasource(f"local://{path}"), None, None, None, None, ctx
+        )
+        assert "scheduling_strategy" not in args
+        assert node_id_key in args["label_selector"]
+
+
 def test_local_paths_with_client_raises_error(ray_start_cluster_enabled, tmp_path):
     ray_start_cluster_enabled.add_node(num_cpus=1)
     ray_start_cluster_enabled.head_node._ray_params.ray_client_server_port = "10004"

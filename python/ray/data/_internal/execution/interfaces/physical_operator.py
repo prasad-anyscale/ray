@@ -14,6 +14,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -45,6 +46,8 @@ from ray.data.context import DataContext
 if TYPE_CHECKING:
 
     from ray.data._internal.execution.metadata_fetcher import MetadataFetcher
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
+    from ray.data._internal.execution.streaming_executor_state import OpState
     from ray.data.block import BlockMetadataWithSchema
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,65 @@ METADATA_GET_TIMEOUT_S = 1.0
 
 # TODO(hchen): Ray Core should have a common interface for these two types.
 Waitable = Union[ray.ObjectRef, ObjectRefGenerator]
+
+
+@dataclass(kw_only=True, slots=True, eq=False)
+class TaskPullRequest:
+    bytes_to_read: float
+    blocks_to_read: float
+
+    def max(self, other: "TaskPullRequest"):
+        return TaskPullRequest(
+            bytes_to_read=max(self.bytes_to_read, other.bytes_to_read),
+            blocks_to_read=max(self.blocks_to_read, other.blocks_to_read),
+        )
+
+    def all_fields_gt(self, other: "TaskPullRequest") -> bool:
+        return (
+            self.bytes_to_read > other.bytes_to_read
+            and self.blocks_to_read > other.blocks_to_read
+        )
+
+    @classmethod
+    def zero(cls) -> "TaskPullRequest":
+        return cls(bytes_to_read=0, blocks_to_read=0)
+
+    @classmethod
+    def inf(cls) -> "TaskPullRequest":
+        return cls(bytes_to_read=float("inf"), blocks_to_read=float("inf"))
+
+
+@dataclass
+class TaskPullResponse:
+    bytes_read: float = 0
+    blocks_read: float = 0
+
+    def all_fields_lt(self, other: "TaskPullRequest"):
+        a = self.bytes_read < other.bytes_to_read
+        b = self.blocks_read < other.blocks_to_read
+        return a and b
+
+    def all_fields_gte(self, other: "TaskPullRequest"):
+        a = self.bytes_read >= other.bytes_to_read
+        b = self.blocks_read >= other.blocks_to_read
+        return a and b
+
+
+@dataclass(frozen=True)
+class ObjectStoreUsage:
+    """Per-op object store accounting.
+
+    Attributes:
+        internal: Bytes held by this op's currently-running tasks
+            (outputs not yet yielded to the object store).
+        outputs: Bytes this op has produced that are still live in
+            the object store — its internal output queue, its
+            ``OpState`` external output queue, and the downstream
+            eligible ops' inputs.
+    """
+
+    internal: int
+    outputs: int
 
 
 class OpTask(ABC):
@@ -241,9 +303,10 @@ class DataOpTask(OpTask):
 
     def on_data_ready(
         self,
-        max_bytes_to_read: Optional[int],
+        *,
+        max_to_read: TaskPullRequest,
         metadata_fetcher: "MetadataFetcher",
-    ) -> int:
+    ) -> TaskPullResponse:
         """Pull ready ``(block_ref, meta_ref)`` pairs from the streaming
         generator and let ``metadata_fetcher`` turn each into an emitted
         ``RefBundle``.
@@ -277,24 +340,28 @@ class DataOpTask(OpTask):
         is postponed until the task's deferred pairs have emitted.
 
         Args:
-            max_bytes_to_read: Max bytes of blocks to read. If None, all
-                currently available pairs are drained.
+            max_to_read: Soft max bytes of blocks to read. Hard max on
+                the number of blocks to read (since we can pull 1 block at a
+                time). Will stop pulling from streaming generators when the
+                first limit is reached.
             metadata_fetcher: Strategy that fetches/emits each pulled pair.
 
         Returns:
-            The number of bytes accounted for (for the budget loop).
+            The number of bytes and blocks accounted for (for the budget loop).
         """
-        bytes_read = 0
 
-        self._track_task_output_backpressure(max_bytes_to_read)
+        response = TaskPullResponse()
+
+        self._track_task_output_backpressure(max_to_read)
 
         if self._state is not TaskGeneratorState.ACTIVE or self.has_pending_emits():
             # Already DRAINED, or earlier pairs still await their background
             # metadata fetch. Don't pull further output ahead of unfetched
             # metadata; retry once the pending pairs have emitted.
-            return 0
+            return response
 
-        while max_bytes_to_read is None or bytes_read < max_bytes_to_read:
+        while response.all_fields_lt(max_to_read):
+
             if self._pending_block_ref.is_nil():
                 assert self._pending_meta_ref.is_nil(), (
                     "This method expects streaming generators to yield blocks then "
@@ -373,7 +440,8 @@ class DataOpTask(OpTask):
             # object store). Not refunded on a later drop: the budget is
             # recomputed each scheduling iteration, so there's no balance to
             # restore.
-            bytes_read += object_size
+            response.bytes_read += object_size
+            response.blocks_read += 1
             self._pending_block_ref = ray.ObjectRef.nil()
             self._pending_meta_ref = ray.ObjectRef.nil()
 
@@ -383,19 +451,17 @@ class DataOpTask(OpTask):
         if self.is_drained():
             metadata_fetcher.in_data_ready_done(self)
 
-        return bytes_read
+        return response
 
-    def _track_task_output_backpressure(self, max_bytes_to_read: Optional[int]):
-        if max_bytes_to_read == 0:
+    def _track_task_output_backpressure(self, max_to_read: TaskPullRequest):
+        if not max_to_read.all_fields_gt(TaskPullRequest.zero()):
             # Whenever provided `max_bytes_to_read == 0` we treat as task
             # being in output backpressure, therefore correspondingly starting
             # the timer (if necessary)
             if self._start_output_backpressure_s is None:
                 self._start_output_backpressure_s = time.perf_counter()
 
-        elif (
-            max_bytes_to_read is None or max_bytes_to_read > 0
-        ) and self._start_output_backpressure_s is not None:
+        elif self._start_output_backpressure_s is not None:
             # Increment cumulative duration of task being in output
             # backpressure
             self._total_output_backpressure_s += (
@@ -457,7 +523,7 @@ class DataOpTask(OpTask):
         )
         self._output_ready_callback(
             RefBundle(
-                [BlockEntry(block_ref, meta)],
+                (BlockEntry(block_ref, meta),),
                 owns_blocks=True,
                 schema=meta_with_schema.schema,
             ),
@@ -587,6 +653,7 @@ class PhysicalOperator(Operator):
         )
         self._started = False
         self._shutdown = False
+        self._resource_bank: Optional["ResourceBankBase"] = None
         self._in_task_submission_backpressure = False
         self._task_submission_backpressure_policy: Optional[str] = None
         self._in_task_output_backpressure = False
@@ -601,14 +668,31 @@ class PhysicalOperator(Operator):
         self._id = str(uuid.uuid4())
         # Initialize metrics after data_context is set
         self._metrics = OpRuntimeMetrics(self)
+        # Task indices whose failure the operator has already handled (e.g.
+        # re-dispatched the input bundle to another actor) and whose exception
+        # the executor should therefore swallow rather than count/abort.
+        self._retried_task_indices: Set[int] = set()
 
     def __reduce__(self):
         raise ValueError("Operator is not serializable.")
 
+    def consume_retried_task(self, task_index: int) -> bool:
+        """Whether the failure of ``task_index`` was handled by an internal
+        retry and should be ignored by the executor's error accounting.
+
+        Pops the index so each failure is consumed at most once. Default
+        operators never retry, so this is normally empty.
+        """
+        if task_index in self._retried_task_indices:
+            self._retried_task_indices.discard(task_index)
+            return True
+        return False
+
     @property
     def id(self) -> str:
         """Return a unique identifier for this operator."""
-        return self._id
+
+        return f"{self.name}_{self._id}"
 
     @property
     def data_context(self) -> DataContext:
@@ -706,6 +790,7 @@ class PhysicalOperator(Operator):
         # The transformed node should have a distinct identity and metrics owner.
         target._id = str(uuid.uuid4())
         target._metrics = OpRuntimeMetrics(target)
+        target._resource_bank = None
         # The copied node belongs to a new transformed DAG. Reverse edges are
         # rewired by parents, so avoid carrying stale downstream references.
         target._output_dependencies = []
@@ -904,6 +989,7 @@ class PhysicalOperator(Operator):
         self,
         options: ExecutionOptions,
         block_ref_counter: BlockRefCounter,
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
         """Called by the executor when execution starts for an operator.
 
@@ -911,8 +997,10 @@ class PhysicalOperator(Operator):
             options: The global options used for the overall execution.
             block_ref_counter: The executor-wide shared counter for tracking
                 object-store memory.
+            resource_bank: Optional per-executor ResourceBankBase instance.
         """
         self._block_ref_counter = block_ref_counter
+        self._resource_bank = resource_bank
         self._started = True
 
     def can_add_input(self) -> bool:
@@ -922,6 +1010,10 @@ class PhysicalOperator(Operator):
         backpressure (e.g., waiting for internal actors to be created).
         """
         return True
+
+    def launch_task(self):
+        """Launches a task for this operator. NOTE: `can_submit_task`must return True"""
+        return None
 
     def add_input(self, refs: RefBundle, input_index: int) -> None:
         """Called when an upstream result is available.
@@ -1136,6 +1228,26 @@ class PhysicalOperator(Operator):
             self._in_task_output_backpressure = in_backpressure
         self._task_output_backpressure_policy = policy_name
 
+    def backpressure_progress_str(self) -> str:
+        """Progress-bar tag describing active backpressure, or "" if none.
+
+        Overridable so an operator can report a more informative quantity than
+        the policy name that tripped: an actor pool, for instance, knows what
+        share of its actors is actually blocked.
+        """
+        backpressure_types = []
+        if self._in_task_submission_backpressure:
+            # The op is backpressured from submitting new tasks.
+            policy = self._task_submission_backpressure_policy or ""
+            backpressure_types.append(f"tasks({policy})")
+        if self._in_task_output_backpressure:
+            # The op is backpressured from producing new outputs.
+            policy = self._task_output_backpressure_policy or ""
+            backpressure_types.append(f"outputs({policy})")
+        if not backpressure_types:
+            return ""
+        return f"[backpressured:{','.join(backpressure_types)}]"
+
     def get_autoscaling_actor_pools(self) -> List[AutoscalingActorPool]:
         """Return a list of `AutoscalingActorPool`s managed by this operator."""
         return []
@@ -1164,6 +1276,7 @@ class PhysicalOperator(Operator):
             restarting=0,
             pending=0,
             active=0,
+            terminating=0,
             idle=0,
             pool_utilization=0,
             tasks_in_flight=0,

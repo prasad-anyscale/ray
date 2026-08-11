@@ -14,6 +14,7 @@ from pyarrow.fs import FileSelector, FileType
 import ray
 from ray._common.retry import call_with_retry
 from ray.data._internal.arrow_ops import transform_pyarrow
+from ray.data._internal.execution.execution_flags import actor_only_backend_disabled
 from ray.data._internal.execution.interfaces.ref_bundle import RefBundle
 from ray.data.block import Block, BlockMetadata, Schema
 from ray.data.checkpoint import CheckpointConfig
@@ -247,28 +248,37 @@ class CheckpointManager(abc.ABC):
         if not any(f.type == FileType.File for f in entries):
             return None, 0
 
-        # Load the checkpoint data
-        checkpoint_ds: ray.data.Dataset = ray.data.read_parquet(
-            self.checkpoint_path,
-            filesystem=self.filesystem,
-            partition_filter=self.checkpoint_path_partition_filter,
-        )
-        checkpoint_ds.set_name("checkpoint_dataset")
+        # The loader is an internal bookkeeping dataset whose plan uses
+        # AllToAll operators (repartition below; groupby/sort in subclass
+        # preprocess pipelines), which the actor-only executor rejects. Run it
+        # on the classic backend regardless of the global flag.
+        with actor_only_backend_disabled():
+            # Load the checkpoint data
+            checkpoint_ds: ray.data.Dataset = ray.data.read_parquet(
+                self.checkpoint_path,
+                filesystem=self.filesystem,
+                partition_filter=self.checkpoint_path_partition_filter,
+            )
+            checkpoint_ds.set_name("checkpoint_dataset")
 
-        # Manually disable checkpointing for loading the checkpoint metadata
-        # to avoid recursively restoring checkpoints.
-        # TODO: Clean way to do this would be to introduce per Op config
-        # [https://github.com/ray-project/ray/issues/54520]
-        checkpoint_ds.context.checkpoint_config = None
+            # Manually disable checkpointing for loading the checkpoint metadata
+            # to avoid recursively restoring checkpoints.
+            # TODO: Clean way to do this would be to introduce per Op config
+            # [https://github.com/ray-project/ray/issues/54520]
+            checkpoint_ds.context.checkpoint_config = None
 
-        # Pre-process data pipeline
-        checkpoint_ds: ray.data.Dataset = self._preprocess_data_pipeline(checkpoint_ds)
+            # Pre-process data pipeline
+            checkpoint_ds: ray.data.Dataset = self._preprocess_data_pipeline(
+                checkpoint_ds
+            )
 
-        # Repartition to 1 block.
-        checkpoint_ds = checkpoint_ds.repartition(num_blocks=1)
+            # Repartition to 1 block.
+            checkpoint_ds = checkpoint_ds.repartition(num_blocks=1)
 
-        # Get the block reference
-        ref_bundles: List[RefBundle] = list(checkpoint_ds.iter_internal_ref_bundles())
+            # Get the block reference
+            ref_bundles: List[RefBundle] = list(
+                checkpoint_ds.iter_internal_ref_bundles()
+            )
 
         assert len(ref_bundles) == 1
 

@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Hashable
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import ray
 import ray.exceptions
@@ -200,7 +200,7 @@ class ThreadedMetadataFetcher(MetadataFetcher):
 
         self._request_q: "queue_module.Queue[_Request]" = queue_module.Queue()
         # fetch thread -> executor: meta_ref -> bytes (or captured Exception).
-        self._results: Dict["ray.ObjectRef", Any] = {}
+        self._results: Dict["ray.ObjectRef", bytes | BaseException] = {}
         self._results_lock = threading.Lock()
 
         # Executor-thread-only state below.
@@ -366,7 +366,9 @@ class ThreadedMetadataFetcher(MetadataFetcher):
         self._drained_tasks.difference_update(to_mark_done)
         return failures
 
-    def _pop_result(self, ref: "ray.ObjectRef") -> Any:
+    def _pop_result(
+        self, ref: "ray.ObjectRef"
+    ) -> bytes | BaseException | Literal[_Signal.NOT_READY]:
         with self._results_lock:
             return self._results.pop(ref, _Signal.NOT_READY)
 

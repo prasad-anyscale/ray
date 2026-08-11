@@ -7352,6 +7352,7 @@ class Dataset:
         output.set_name(copy.name)
         output._set_uuid(copy._get_uuid())
         output._execute()  # Populates the cache from the InputData source operator.
+        output._run_index = copy._run_index
         return output
 
     @PublicAPI(api_group=IM_API_GROUP)
@@ -7896,10 +7897,12 @@ class Dataset:
             - Iterator is fully exhausted (ie until StopIteration is raised)
             - Executor instances is garbage-collected
         """
-        from ray.data._internal.execution.streaming_executor import StreamingExecutor
+        from ray.data._internal.execution.streaming_executor import (
+            get_streaming_executor_cls,
+        )
 
         self._run_index += 1
-        return StreamingExecutor(self._context, self.get_dataset_id())
+        return get_streaming_executor_cls()(self._context, self.get_dataset_id())
 
     def _initial_stats(self) -> DatasetStats:
         """The initial stats to seed a fresh executor for this dataset.

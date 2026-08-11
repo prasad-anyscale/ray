@@ -75,7 +75,7 @@ def plan_read_files_op(
                     table = block_udf(table)
                 yield table
 
-    return MapOperator.create(
+    read_op = MapOperator.create(
         MapTransformer(
             [
                 BlockMapTransformFn(
@@ -92,5 +92,7 @@ def plan_read_files_op(
         name=op.name,
         compute_strategy=op.compute,
         ray_remote_args=op.ray_remote_args,
+        is_read_op=True,
         isolate_workers=data_context.isolate_read_workers,
     )
+    return read_op

@@ -198,7 +198,9 @@ class TaskPoolMapOperator(MapOperator):
 
         self._current_logical_usage = self._current_logical_usage.add(logical_usage)
 
-        def task_done_callback():
+        def task_done_callback(
+            inputs: RefBundle, task_index: int, exception: Optional[Exception]
+        ):
             self._current_logical_usage = self._current_logical_usage.subtract(
                 logical_usage
             )

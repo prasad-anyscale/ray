@@ -2027,6 +2027,42 @@ def test_write_retry_on_transient_error(pyiceberg_table, fast_retry_config):
     assert len(result.data_files) > 0, "Expected data files in result"
 
 
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+def test_write_reloads_table_when_metadata_unset():
+    """A write worker that never ran on_write_start has _table_metadata=None.
+
+    This is the actor-only case: the Write op's persistent actors are created
+    eagerly (before the first input / on_write_start), so the datasink they are
+    seeded with has no table metadata. write() must lazily reload the table
+    instead of raising ``AttributeError: 'NoneType' object has no attribute
+    'properties'`` inside pyiceberg's _dataframe_to_data_files.
+    """
+    from ray.data._internal.datasource.iceberg_datasink import IcebergDatasink
+    from ray.data._internal.execution.interfaces import TaskContext
+
+    datasink = IcebergDatasink(
+        table_identifier=f"{_DB_NAME}.{_TABLE_NAME}",
+        catalog_kwargs=_CATALOG_KWARGS.copy(),
+    )
+    # Simulate the actor-only write worker: on_write_start ran on the driver, not
+    # here, so this datasink instance arrives with no table metadata.
+    assert datasink._table_metadata is None
+
+    data = pa.Table.from_pydict(
+        {"col_a": [300, 301], "col_b": ["x", "y"], "col_c": [7, 7]},
+        schema=_SCHEMA,
+    )
+    task_ctx = TaskContext(task_idx=0, op_name="Write")
+    result = datasink.write([data], task_ctx)
+
+    # write() should have lazily reloaded the table and produced data files.
+    assert datasink._table_metadata is not None
+    assert len(result.data_files) > 0
+
+
 if __name__ == "__main__":
     import sys
 

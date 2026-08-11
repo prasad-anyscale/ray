@@ -18,6 +18,9 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.stats import StatsDict
 from ray.data.context import DataContext
 
+if TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
+
 
 class UnionOperator(InternalQueueOperatorMixin, NAryOperator):
     """An operator that combines output blocks from
@@ -66,12 +69,13 @@ class UnionOperator(InternalQueueOperatorMixin, NAryOperator):
         self,
         options: ExecutionOptions,
         block_ref_counter: "BlockRefCounter",
-    ):
+        resource_bank: Optional["ResourceBankBase"] = None,
+    ) -> None:
         # Whether to preserve deterministic ordering of output blocks.
         # When True, blocks are emitted in round-robin order across inputs,
         # ensuring the same input always produces the same output order.
         self._preserve_order = options.preserve_order
-        super().start(options, block_ref_counter)
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
 
     def num_outputs_total(self) -> Optional[int]:
         num_outputs = 0

@@ -11,6 +11,9 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.stats import StatsDict
 from ray.data.context import DataContext
 
+if TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
+
 
 class InputDataBuffer(PhysicalOperator):
     """Defines the input data for the operator DAG.
@@ -23,7 +26,9 @@ class InputDataBuffer(PhysicalOperator):
         self,
         data_context: DataContext,
         input_data: Optional[List[RefBundle]] = None,
-        input_data_factory: Optional[Callable[[int], List[RefBundle]]] = None,
+        input_data_factory: Optional[
+            Callable[[PhysicalOperator, int], List[RefBundle]]
+        ] = None,
     ):
         """Create an InputDataBuffer.
 
@@ -52,11 +57,13 @@ class InputDataBuffer(PhysicalOperator):
         self,
         options: ExecutionOptions,
         block_ref_counter: "BlockRefCounter",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
         if not self._is_input_initialized:
             self._input_data = self._input_data_factory(
+                self,
                 self.target_max_block_size_override
-                or self.data_context.target_max_block_size
+                or self.data_context.target_max_block_size,
             )
             self._is_input_initialized = True
             self._initialize_metadata()
@@ -64,7 +71,13 @@ class InputDataBuffer(PhysicalOperator):
         # so we record input metrics here
         for bundle in self._input_data:
             self._metrics.on_input_received(bundle)
-        super().start(options, block_ref_counter)
+        if resource_bank is not None:
+            for bundle in self._input_data:
+                for entry in bundle.blocks:
+                    resource_bank.on_new_output(
+                        op=self, ref=entry.ref, bm=entry.metadata
+                    )
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
 
     def has_next(self) -> bool:
         return self._input_data_index < len(self._input_data)

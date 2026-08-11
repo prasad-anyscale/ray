@@ -8,7 +8,10 @@ from typing import Dict, List, Optional, Tuple
 from ray.data._internal.actor_autoscaler import (
     create_actor_autoscaler,
 )
-from ray.data._internal.cluster_autoscaler import create_cluster_autoscaler
+from ray.data._internal.cluster_autoscaler import (
+    ClusterAutoscaler,
+    create_cluster_autoscaler,
+)
 from ray.data._internal.execution import create_ranker
 from ray.data._internal.execution.backpressure_policy import (
     BackpressurePolicy,
@@ -17,6 +20,7 @@ from ray.data._internal.execution.backpressure_policy import (
 from ray.data._internal.execution.block_ref_counter import BlockRefCounter
 from ray.data._internal.execution.dataset_state import DatasetState
 from ray.data._internal.execution.execution_callback import ExecutionCallback
+from ray.data._internal.execution.execution_flags import actor_only_backend_enabled
 from ray.data._internal.execution.interfaces import (
     Executor,
     OutputIterator,
@@ -29,6 +33,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.resource_bank import ResourceBank, ResourceBankBase
 from ray.data._internal.execution.resource_manager import (
     ResourceManager,
 )
@@ -139,6 +144,9 @@ class StreamingExecutor(Executor, threading.Thread):
         self._output_node: Optional[Tuple[PhysicalOperator, OpState]] = None
         self._backpressure_policies: List[BackpressurePolicy] = []
         self._op_schema: Dict[PhysicalOperator, Schema] = {}
+        self._resource_bank: Optional[ResourceBankBase] = (
+            ResourceBank() if actor_only_backend_enabled() else None
+        )
 
         self._dataset_id = dataset_id
         # Set by IssueDetectionExecutionCallback when issue detection is registered;
@@ -231,7 +239,10 @@ class StreamingExecutor(Executor, threading.Thread):
         # Setup the streaming DAG topology and start the runner thread.
         self._block_ref_counter = BlockRefCounter()
         self._topology = build_streaming_topology(
-            dag, self._options, self._block_ref_counter
+            dag,
+            self._options,
+            self._block_ref_counter,
+            resource_bank=self._resource_bank,
         )
 
         self._resource_manager = ResourceManager(
@@ -259,12 +270,7 @@ class StreamingExecutor(Executor, threading.Thread):
         self._backpressure_policies = get_backpressure_policies(
             self._data_context, self._topology, self._resource_manager
         )
-        self._cluster_autoscaler = create_cluster_autoscaler(
-            self._topology,
-            self._resource_manager,
-            self._data_context,
-            execution_id=self._dataset_id,
-        )
+        self._cluster_autoscaler = self._create_cluster_autoscaler()
         self._actor_autoscaler = create_actor_autoscaler(
             self._topology,
             self._resource_manager,
@@ -279,9 +285,7 @@ class StreamingExecutor(Executor, threading.Thread):
 
         self._output_node = dag, self._topology[dag]
 
-        op_to_id = {
-            op: self._get_operator_id(op, i) for i, op in enumerate(self._topology)
-        }
+        op_to_id = {op: op_state.op_tag() for op, op_state in self._topology.items()}
         _StatsManager.register_dataset_to_stats_actor(
             self._dataset_id,
             self._get_operator_tags(),
@@ -291,10 +295,26 @@ class StreamingExecutor(Executor, threading.Thread):
         for callback in self._callbacks:
             callback.before_execution_starts(self)
 
+        self.bootstrap()
+
         self.start()
         self._execution_started = True
 
         return _ClosingIterator(self)
+
+    def _create_cluster_autoscaler(self) -> ClusterAutoscaler:
+        """Build this executor's cluster autoscaler."""
+        assert self._topology is not None
+        return create_cluster_autoscaler(
+            self._topology,
+            self._resource_manager,
+            self._data_context,
+            execution_id=self._dataset_id,
+        )
+
+    def bootstrap(self):
+        """Additional code to run before streaming execution starts"""
+        pass
 
     def __del__(self):
         # NOTE: Upon garbage-collection we're allowing running tasks
@@ -437,7 +457,6 @@ class StreamingExecutor(Executor, threading.Thread):
                 continue_sched = self._scheduling_loop_step(self._topology)
 
                 sched_loop_duration = time.perf_counter() - t_start
-
                 self.update_metrics(sched_loop_duration)
                 if self._initial_stats:
                     self._initial_stats.streaming_exec_schedule_s.add(
@@ -557,6 +576,18 @@ class StreamingExecutor(Executor, threading.Thread):
         self._cluster_autoscaler.try_trigger_scaling()
         self._actor_autoscaler.try_trigger_scaling()
 
+        return self._finalize_scheduling_loop_step(topology)
+
+    def _finalize_scheduling_loop_step(self, topology: Topology) -> bool:
+        """Shared tail of a scheduling-loop step.
+
+        Updates operator states, refreshes progress/stats,
+        exports schemas, logs newly-completed operators, and returns whether the
+        loop should keep running. Factored out so the actor-only
+        ``ExperimentalStreamingExecutor`` can reuse it after its own (different)
+        task-dispatch phase.
+        """
+
         update_operator_states(topology)
         self._refresh_progress_manager(topology)
 
@@ -589,13 +620,19 @@ class StreamingExecutor(Executor, threading.Thread):
         self._no_progress_guard.check()
         return should_continue
 
+    def _get_operator_progress_extra(self, op_state: OpState) -> str:
+        return ""
+
     def _refresh_progress_manager(self, topology: Topology):
         # Update the progress manager to reflect scheduling decisions.
         if self._progress_manager:
             for op_state in topology.values():
                 if not isinstance(op_state.op, InputDataBuffer):
                     self._progress_manager.update_operator_progress(
-                        op_state, self._resource_manager
+                        op_state,
+                        self._resource_manager,
+                        extra_summary=self._get_operator_progress_extra(op_state),
+                        resource_bank=self._resource_bank,
                     )
             self._progress_manager.refresh()
 
@@ -687,14 +724,9 @@ class StreamingExecutor(Executor, threading.Thread):
 
         self._progress_manager.update_total_resource_status(resources_status)
 
-    def _get_operator_id(self, op: PhysicalOperator, topology_index: int) -> str:
-        return f"{op.name}_{topology_index}"
-
     def _get_operator_tags(self):
         """Returns a list of operator tags."""
-        return [
-            f"{self._get_operator_id(op, i)}" for i, op in enumerate(self._topology)
-        ]
+        return [f"{op_state.op_tag()}" for op_state in self._topology.values()]
 
     def _get_state_dict(self, state):
         last_op, last_state = list(self._topology.items())[-1]
@@ -707,7 +739,7 @@ class StreamingExecutor(Executor, threading.Thread):
             if state in (DatasetState.FINISHED.name, DatasetState.FAILED.name)
             else None,
             "operators": {
-                f"{self._get_operator_id(op, i)}": {
+                f"{op_state.op_tag()}": {
                     "name": op.name,
                     "progress": op_state.num_completed_tasks,
                     "total": op.num_outputs_total(),
@@ -734,6 +766,26 @@ class StreamingExecutor(Executor, threading.Thread):
                 self._get_state_dict(state=state),
             )
             self._metrics_last_updated = now
+
+
+def get_streaming_executor_cls() -> type:
+    """Return the ``StreamingExecutor`` class to instantiate.
+
+    Under the actor-only backend this returns the
+    ``ExperimentalStreamingExecutor`` subclass (which overrides the scheduling
+    loop for the pull-based actor design); otherwise the OSS
+    ``StreamingExecutor``. This is the executor-selection wiring seam, mirroring
+    the operator factories in ``operators/__init__.py``.
+    """
+    from ray.data._internal.execution.execution_flags import actor_only_backend_enabled
+
+    if actor_only_backend_enabled():
+        from ray.data._internal.experimental.execution.streaming_executor import (
+            ExperimentalStreamingExecutor,
+        )
+
+        return ExperimentalStreamingExecutor
+    return StreamingExecutor
 
 
 def _debug_dump_topology(topology: Topology, resource_manager: ResourceManager) -> None:

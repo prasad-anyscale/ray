@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from typing import Callable, Optional, Type
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,6 +28,7 @@ from ray_release.exception import (
 )
 from ray_release.file_manager.job_file_manager import JobFileManager
 from ray_release.glue import (
+    _running_test_script,
     command_runner_to_cluster_manager,
     run_release_test,
     type_str_to_command_runner,
@@ -440,6 +442,53 @@ class GlueTest(unittest.TestCase):
 
         self.assertEqual(result.return_code, ExitCode.SUCCESS.value)
         self.assertEqual(result.status, "success")
+
+
+def _run_script_env(test: MockTest, command_timeout: int = 3600) -> dict:
+    """Run _running_test_script with a mock runner; return the env it was called with."""
+    runner = MagicMock()
+    _running_test_script(
+        test=test, smoke_test=False, runner=runner, command_timeout=command_timeout
+    )
+    assert runner.run_command.called
+    return runner.run_command.call_args.kwargs["env"]
+
+
+def _make_test(team: str, runtime_env: list) -> MockTest:
+    return MockTest(
+        name="env_forward_test",
+        team=team,
+        run=dict(type="unit_test", script="test_cmd"),
+        cluster=dict(byod={"runtime_env": runtime_env}),
+    )
+
+
+def test_forwards_ray_data_build_env(monkeypatch):
+    """RAY_DATA_* vars set at the build level reach a test's cluster env."""
+    monkeypatch.setenv("RAY_DATA_ACTOR_ONLY_BACKEND", "1")
+    monkeypatch.setenv("OTHER_VAR", "x")
+    env = _run_script_env(_make_test(team="data", runtime_env=["EXISTING=1"]))
+    assert env["RAY_DATA_ACTOR_ONLY_BACKEND"] == "1"  # forwarded
+    assert env["EXISTING"] == "1"  # per-test runtime_env preserved
+    assert "OTHER_VAR" not in env  # only RAY_DATA_ prefix is forwarded
+
+
+def test_forwards_ray_data_build_env_to_all_teams(monkeypatch):
+    """The forward applies to every team: RAY_DATA_* vars are inert for tests
+    that never touch Ray Data, and teams like llm consume them via ray.data.llm."""
+    monkeypatch.setenv("RAY_DATA_ACTOR_ONLY_BACKEND", "1")
+    for team in ("llm", "core"):
+        env = _run_script_env(_make_test(team=team, runtime_env=[]))
+        assert env["RAY_DATA_ACTOR_ONLY_BACKEND"] == "1"  # forwarded
+
+
+def test_per_test_runtime_env_wins_over_build_env(monkeypatch):
+    """setdefault: a test that pins a flag in runtime_env keeps its own value."""
+    monkeypatch.setenv("RAY_DATA_ACTOR_ONLY_BACKEND", "0")
+    env = _run_script_env(
+        _make_test(team="data", runtime_env=["RAY_DATA_ACTOR_ONLY_BACKEND=1"])
+    )
+    assert env["RAY_DATA_ACTOR_ONLY_BACKEND"] == "1"  # pinned value wins
 
 
 if __name__ == "__main__":

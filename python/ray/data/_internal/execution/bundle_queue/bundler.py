@@ -17,6 +17,14 @@ if TYPE_CHECKING:
 class RebundlingStrategy(abc.ABC):
     """Base class for strategies describing how to rebundle queues."""
 
+    @property
+    @abc.abstractmethod
+    def min_rows_per_bundle(self) -> int:
+        """The row target a batch of pending bundles must reach before a ready
+        bundle can be built (0 means no target / build as soon as any row is
+        pending)."""
+        ...
+
     @abc.abstractmethod
     def can_build_ready_bundle(self, num_pending_rows: int) -> bool:
         """Signifies whether we can build a ready bundle. A ready bundle is a bundle
@@ -59,6 +67,11 @@ class EstimateSize(RebundlingStrategy):
 
         self._min_rows_per_bundle: Optional[int] = min_rows_per_bundle
 
+    @property
+    @override
+    def min_rows_per_bundle(self) -> int:
+        return self._min_rows_per_bundle or 0
+
     @override
     def can_build_ready_bundle(self, num_pending_rows: int) -> bool:
         return num_pending_rows > 0 and (
@@ -80,6 +93,11 @@ class ExactMultipleSize(RebundlingStrategy):
             target_num_rows_per_block > 0
         ), "target_num_rows_per_block must be positive for streaming repartition."
         self._target_num_rows = target_num_rows_per_block
+
+    @property
+    @override
+    def min_rows_per_bundle(self) -> int:
+        return self._target_num_rows
 
     @override
     def can_build_ready_bundle(self, num_pending_rows: int) -> bool:
@@ -140,6 +158,10 @@ class RebundleQueue(BaseBundleQueue):
         # The original bundles that formed a ready bundle
         self._consumed_bundles_list: Deque[List[RefBundle]] = deque()
         self._total_pending_rows: int = 0
+
+    @property
+    def min_rows_per_bundle(self) -> int:
+        return self._strategy.min_rows_per_bundle
 
     def _merge_bundles(self):
         """Combine *ALL* pending_bundles into a single, ready bundle."""

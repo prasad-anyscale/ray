@@ -98,7 +98,7 @@ def mock_join_op(left_input_op, right_input_op):
             partition_size_hint=1,
         )
 
-    op.start = MagicMock(side_effect=lambda *_: None)
+    op.start = MagicMock(side_effect=lambda *_, **__: None)
     return op
 
 

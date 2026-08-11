@@ -54,7 +54,10 @@ class HighMemoryIssueDetector(IssueDetector):
         for op in operators:
             if isinstance(op, MapOperator):
                 self._initial_memory_requests[op] = (
-                    op._get_dynamic_ray_remote_args().get("memory") or 0
+                    op._get_dynamic_ray_remote_args(
+                        invoke_ray_remote_args_fn=False
+                    ).get("memory")
+                    or 0
                 )
 
     @classmethod
@@ -84,7 +87,9 @@ class HighMemoryIssueDetector(IssueDetector):
             if op.metrics.average_max_uss_per_task is None:
                 continue
 
-            remote_args = op._get_dynamic_ray_remote_args()
+            remote_args = op._get_dynamic_ray_remote_args(
+                invoke_ray_remote_args_fn=False
+            )
             safe_memory_per_task = get_safe_default_logical_memory(remote_args)
 
             if (

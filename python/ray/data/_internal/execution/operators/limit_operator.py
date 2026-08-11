@@ -3,6 +3,7 @@ from dataclasses import replace
 from typing import Deque, List, Optional, Tuple
 
 import ray
+from ray.data._internal.execution.execution_flags import actor_only_backend_enabled
 from ray.data._internal.execution.interfaces import (
     BlockEntry,
     PhysicalOperator,
@@ -59,7 +60,9 @@ class LimitOperator(OneToOneOperator):
                 self._consumed_rows += num_rows
             else:
                 # Slice the last block.
-                def slice_fn(block, metadata, num_rows) -> Tuple[Block, BlockMetadata]:
+                def slice_fn(
+                    block, metadata: BlockMetadata, num_rows: int
+                ) -> Tuple[Block, BlockMetadata]:
                     block = BlockAccessor.for_block(block).slice(
                         0, num_rows, copy=False
                     )
@@ -81,6 +84,15 @@ class LimitOperator(OneToOneOperator):
                 )
                 out_blocks.append(block)
                 metadata = ray.get(metadata_ref)
+                assert isinstance(metadata, BlockMetadata)
+                # Sliced blocks are new ObjectRefs; register so sink withdraw matches on_new_output.
+                if actor_only_backend_enabled():
+                    assert self._resource_bank is not None
+                    self._resource_bank.on_new_output(
+                        op=self,
+                        ref=block,
+                        bm=metadata,
+                    )
                 # Slicing creates a new block; register it for memory tracking.
                 self._block_ref_counter.on_block_produced(
                     block, metadata.size_bytes or 0, self.id
@@ -91,7 +103,7 @@ class LimitOperator(OneToOneOperator):
                 break
         self._cur_output_bundles += 1
         out_refs = RefBundle(
-            [BlockEntry(b, m) for b, m in zip(out_blocks, out_metadata)],
+            tuple(BlockEntry(b, m) for b, m in zip(out_blocks, out_metadata)),
             owns_blocks=refs.owns_blocks,
             schema=refs.schema,
         )

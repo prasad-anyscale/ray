@@ -8,6 +8,7 @@ from ray.data._internal.cluster_autoscaler.default_autoscaling_coordinator impor
     HEAD_NODE_RESOURCE_LABEL,
     DefaultAutoscalingCoordinator,
     _AutoscalingCoordinatorActor,
+    _coordinator_scheduling_strategy,
     _format_resources_for_log,
     get_or_create_autoscaling_coordinator,
 )
@@ -255,6 +256,17 @@ def test_format_resources_for_log():
     assert "anyscale/" not in log_message
     assert "node:" not in log_message
     assert "GPU" not in log_message
+
+
+def test_coordinator_scheduling_strategy_is_soft():
+    """The coordinator is detached with max_restarts=-1; its node preference is
+    a locality optimization, not a correctness pin. With soft=False, losing the
+    creating node makes every restart attempt raise ActorUnschedulableError to
+    all callers forever (observed as teardown/chaos noise in release runs)."""
+    node_id = "ab" * 28  # NodeID is 28 bytes, rendered as 56 hex chars.
+    strategy = _coordinator_scheduling_strategy(node_id)
+    assert strategy.node_id == node_id
+    assert strategy.soft is True
 
 
 @pytest.fixture

@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .base_autoscaling_coordinator import (
     AutoscalingCoordinator,
@@ -27,6 +27,7 @@ class FakeAutoscalingCoordinator(AutoscalingCoordinator):
         self,
         get_time: Callable[[], float] = time.time,
         initial_cluster_resources: Optional[List[ResourceDict]] = None,
+        initial_cluster_resources_by_node: Optional[Dict[str, ResourceDict]] = None,
     ):
         """Initialize the coordinator.
 
@@ -37,12 +38,18 @@ class FakeAutoscalingCoordinator(AutoscalingCoordinator):
                 ``request_remaining`` is True, the coordinator allocates these resources
                 to the requester. Otherwise, the coordinator allocates the requested
                 resources.
+            initial_cluster_resources_by_node: Per-node allocation returned by
+                ``get_reserved_resources_by_node`` while an unexpired
+                allocation exists.
         """
         if initial_cluster_resources is None:
             initial_cluster_resources = []
+        if initial_cluster_resources_by_node is None:
+            initial_cluster_resources_by_node = {}
 
         self._get_time = get_time
         self._initial_cluster_resources = initial_cluster_resources
+        self._initial_cluster_resources_by_node = initial_cluster_resources_by_node
         self._allocation: Optional[FakeAutoscalingCoordinator.Allocation] = None
 
     def request_resources(
@@ -82,3 +89,14 @@ class FakeAutoscalingCoordinator(AutoscalingCoordinator):
             return []
 
         return [r.copy() for r in self._allocation.resources]
+
+    def get_reserved_resources_by_node(self) -> Dict[str, ResourceDict]:
+        """Return the configured per-node allocation while unexpired."""
+        # Reuse the expiry handling from get_reserved_resources.
+        self.get_reserved_resources()
+        if self._allocation is None:
+            return {}
+        return {
+            node_id: r.copy()
+            for node_id, r in self._initial_cluster_resources_by_node.items()
+        }

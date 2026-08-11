@@ -51,6 +51,7 @@ def test_actor_pool_scaling():
         min_size=MagicMock(return_value=5),
         max_size=MagicMock(return_value=15),
         current_size=MagicMock(return_value=10),
+        serving_size=MagicMock(return_value=10),
         num_active_actors=MagicMock(return_value=10),
         num_running_actors=MagicMock(return_value=10),
         num_pending_actors=MagicMock(return_value=0),
@@ -76,7 +77,9 @@ def test_actor_pool_scaling():
         num_output_splits=MagicMock(return_value=1),
     )
     op_state = OpState(
-        op, inqueues=[MagicMock(__len__=MagicMock(return_value=10), num_blocks=10)]
+        op,
+        inqueues=[MagicMock(__len__=MagicMock(return_value=10), num_blocks=10)],
+        index=0,
     )
     op_state._scheduling_status = MagicMock(under_resource_limits=True)
 
@@ -133,7 +136,7 @@ def test_actor_pool_scaling():
 
     # Should be no-op since we have reached the max size (ie could not scale
     # up even though utilization > threshold)
-    with patch(actor_pool, "current_size", 15):
+    with patch(actor_pool, "serving_size", 15):
         with patch(actor_pool, "num_tasks_in_flight", 20):
             assert_autoscaling_action(
                 delta=0,
@@ -142,7 +145,7 @@ def test_actor_pool_scaling():
 
     # Should be no-op since we have reached the min size (ie could not scale
     # down even though utilization < threshold)
-    with patch(actor_pool, "current_size", 5):
+    with patch(actor_pool, "serving_size", 5):
         with patch(actor_pool, "num_tasks_in_flight", 2):
             assert_autoscaling_action(
                 delta=0,
@@ -150,7 +153,7 @@ def test_actor_pool_scaling():
             )
 
     # Should scale up since the pool is below the min size.
-    with patch(actor_pool, "current_size", 4):
+    with patch(actor_pool, "serving_size", 4):
         assert_autoscaling_action(
             delta=1,
             expected_reason="pool below min size",
@@ -161,7 +164,7 @@ def test_actor_pool_scaling():
     with patch(op, "has_completed", True):
         # NOTE: We simulate actor pool dipping below min size upon
         #       completion (to verify that it will be able to scale to 0)
-        with patch(actor_pool, "current_size", 5):
+        with patch(actor_pool, "serving_size", 5):
             assert_autoscaling_action(
                 delta=-1,
                 expected_reason="consumed all inputs",
@@ -215,7 +218,7 @@ def test_actor_pool_scaling():
         )
 
     # Should scale down since the pool is above the max size.
-    with patch(actor_pool, "current_size", 16):
+    with patch(actor_pool, "serving_size", 16):
         assert_autoscaling_action(
             delta=-1,
             expected_reason="pool exceeding max size",
@@ -249,11 +252,11 @@ def test_actor_pool_scaling():
                 expected_reason="actor pool exceeds resource allocation",
             )
 
-    # Over-budget but current_size=6 (min_size+1): required=2 but can only
+    # Over-budget but serving_size=6 (min_size+1): required=2 but can only
     # release 1 actor (max_can_release = 6 - 5 = 1).
     with patch(resource_manager, "get_allocation", ExecutionResources(cpu=8)):
         with patch(resource_manager, "get_op_usage", ExecutionResources(cpu=10)):
-            with patch(actor_pool, "current_size", 6):
+            with patch(actor_pool, "serving_size", 6):
                 assert_autoscaling_action(
                     delta=-1,
                     expected_reason="actor pool exceeds resource allocation",
@@ -262,7 +265,7 @@ def test_actor_pool_scaling():
     # Over-budget but pool is at min_size (current=5): cannot release any actors.
     with patch(resource_manager, "get_allocation", ExecutionResources(cpu=8)):
         with patch(resource_manager, "get_op_usage", ExecutionResources(cpu=10)):
-            with patch(actor_pool, "current_size", 5):
+            with patch(actor_pool, "serving_size", 5):
                 assert_autoscaling_action(
                     delta=0,
                     expected_reason="actor pool exceeds resource allocation "
@@ -282,7 +285,7 @@ def test_actor_pool_scaling():
     # Cross-resource: GPU-only pool (per_actor.cpu=0) with negative CPU budget
     # but positive GPU budget. CPU over-budget doesn't trigger since the pool
     # doesn't consume CPU. GPU headroom = floor(5/1)=5, capped by
-    # max_size(15)-current_size(10)=5.
+    # max_size(15)-serving_size(10)=5.
     with patch(actor_pool, "per_actor_resource_usage", ExecutionResources(gpu=1)):
         with patch(
             resource_manager, "get_allocation", ExecutionResources(cpu=8, gpu=10)
@@ -332,6 +335,7 @@ def autoscaler_max_upscaling_delta_setup():
         min_size=MagicMock(return_value=5),
         max_size=MagicMock(return_value=20),
         current_size=MagicMock(return_value=10),
+        serving_size=MagicMock(return_value=10),
         get_current_size=MagicMock(return_value=10),
         num_pending_actors=MagicMock(return_value=0),
         num_tasks_in_flight=MagicMock(return_value=40),
@@ -372,7 +376,7 @@ def test_actor_pool_scaling_respects_small_max_upscaling_delta(
         op=op,
         op_state=op_state,
     )
-    # With current_size=10, util=2.0, threshold=1.0:
+    # With serving_size=10, util=2.0, threshold=1.0:
     # plan_delta = ceil(10 * (2.0/1.0 - 1)) = ceil(10) = 10
     # However, delta is limited by max_upscaling_delta=3, so delta = min(10, 3) = 3
     assert request.delta == 3
@@ -396,10 +400,10 @@ def test_actor_pool_scaling_respects_large_max_upscaling_delta(
         op=op,
         op_state=op_state,
     )
-    # With current_size=10, util=2.0, threshold=1.0:
+    # With serving_size=10, util=2.0, threshold=1.0:
     # plan_delta = ceil(10 * (2.0/1.0 - 1)) = ceil(10) = 10
     # max_upscaling_delta=100 is large enough, but delta is limited by max_size:
-    # max_size(20) - current_size(10) = 10, so delta = min(10, 100, 10) = 10
+    # max_size(20) - serving_size(10) = 10, so delta = min(10, 100, 10) = 10
     assert request.delta == 10
 
 

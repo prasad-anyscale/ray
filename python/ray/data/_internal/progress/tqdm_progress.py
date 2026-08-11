@@ -15,6 +15,7 @@ from ray.data._internal.progress.base_progress import (
 from ray.data._internal.progress.progress_bar import ProgressBar
 
 if typing.TYPE_CHECKING:
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
     from ray.data._internal.execution.resource_manager import ResourceManager
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
 
@@ -151,12 +152,21 @@ class TqdmExecutionProgressManager(BaseExecutionProgressManager):
 
     # Operator Progress
     def update_operator_progress(
-        self, opstate: "OpState", resource_manager: "ResourceManager"
+        self,
+        opstate: "OpState",
+        resource_manager: "ResourceManager",
+        extra_summary: str = "",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ):
         pg = self._op_display.get(opstate)
         if pg is not None:
             pg.update_absolute(
                 opstate.op.metrics.row_outputs_taken, opstate.op.num_output_rows_total()
             )
-            summary_str = format_op_state_summary(opstate, resource_manager)
+            summary_str = format_op_state_summary(
+                opstate,
+                resource_manager,
+                extra_summary=extra_summary,
+                resource_bank=resource_bank,
+            )
             pg.set_description(f"- {opstate.op.name}: {summary_str}")

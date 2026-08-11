@@ -81,6 +81,7 @@ from ray.data.context import (
 
 if typing.TYPE_CHECKING:
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
     from ray.data._internal.progress.base_progress import BaseProgressBar
 
 logger = logging.getLogger(__name__)
@@ -678,8 +679,9 @@ class HashShufflingOperatorBase(PhysicalOperator, SubProgressBarMixin):
         self,
         options: ExecutionOptions,
         block_ref_counter: "BlockRefCounter",
+        resource_bank: Optional["ResourceBankBase"] = None,
     ) -> None:
-        super().start(options, block_ref_counter)
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
 
     @property
     def shuffle_name(self) -> str:

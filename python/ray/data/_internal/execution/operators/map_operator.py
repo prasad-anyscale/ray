@@ -20,6 +20,8 @@ from typing import (
     Union,
 )
 
+from typing_extensions import override
+
 from ray._private.ray_constants import (
     DEFAULT_OBJECT_STORE_MEMORY_PROPORTION,
     DEFAULT_SYSTEM_RESERVED_MEMORY_PROPORTION,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from ray.data._internal.execution.block_ref_counter import BlockRefCounter
+    from ray.data._internal.execution.resource_bank import ResourceBankBase
 
 import ray
 from ray import ObjectRef
@@ -38,6 +41,7 @@ from ray.data._internal.compute import (
     ActorPoolStrategy,
     ComputeStrategy,
     TaskPoolStrategy,
+    maybe_promote_compute_strategy,
 )
 from ray.data._internal.execution.bundle_queue import (
     BaseBundleQueue,
@@ -54,6 +58,7 @@ from ray.data._internal.execution.interfaces import (
     RefBundle,
     TaskContext,
 )
+from ray.data._internal.execution.interfaces.common import LogicalActorId
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
     MetadataOpTask,
@@ -211,6 +216,10 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
     Warn if the size of the map UDF exceeds this threshold.
     """
 
+    is_read_op: bool = False
+    """Whether this op reads from a datasource. Set by the read planners (and
+    propagated through fusion)."""
+
     def __init__(
         self,
         map_transformer: MapTransformer,
@@ -255,9 +264,11 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._remote_args_for_metrics = copy.deepcopy(self._ray_remote_args)
 
         # Bundles block references up to the min_rows_per_bundle target.
-        self._block_ref_bundler = ref_bundler
-        if self._block_ref_bundler is None:
-            self._block_ref_bundler = RebundleQueue(EstimateSize(min_rows_per_bundle))
+        self._block_ref_bundler = (
+            RebundleQueue(EstimateSize(min_rows_per_bundle))
+            if ref_bundler is None
+            else ref_bundler
+        )
 
         # Queue for task outputs, either ordered or unordered (this is set by start()).
         self._output_queue: Optional[BaseBundleQueue] = None
@@ -353,6 +364,10 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             name += f"->SplitBlocks({self._additional_split_factor})"
         return name
 
+    @override
+    def min_num_rows_needed_to_make_progress(self) -> int:
+        return self._block_ref_bundler.min_rows_per_bundle
+
     @classmethod
     def create(
         cls,
@@ -373,6 +388,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         per_block_limit: Optional[int] = None,
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
         isolate_workers: bool = False,
+        is_read_op: bool = False,
     ) -> "MapOperator":
         """Create a MapOperator.
 
@@ -413,6 +429,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 scheduled on the same worker processes as this operator's. This flag
                 is useful to prevent side-effects from affecting other operators, like
                 large PyArrow memory allocations.
+            is_read_op: Whether this op reads from a datasource.
 
         Returns:
             A ``MapOperator`` instance whose concrete subclass depends on the
@@ -428,6 +445,11 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         if compute_strategy is None:
             compute_strategy = TaskPoolStrategy()
 
+        # The actor-only backend transparently promotes ``TaskPoolStrategy`` to
+        # ``ActorPoolStrategy`` here; this is a no-op otherwise. The decision is
+        # self-gated inside the helper so this factory stays backend-agnostic.
+        compute_strategy = maybe_promote_compute_strategy(compute_strategy)
+
         # Apply per-block limit to the map transformer if set
         if per_block_limit is not None:
             map_transformer = _wrap_transformer_with_limit(
@@ -439,7 +461,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             )
 
             TaskPoolMapOperator = get_task_pool_map_operator_cls()
-            return TaskPoolMapOperator(
+            task_op = TaskPoolMapOperator(
                 map_transformer,
                 input_op,
                 data_context,
@@ -456,6 +478,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 isolate_workers=isolate_workers,
                 default_logical_memory_enabled=data_context.default_map_logical_memory_enabled,
             )
+            task_op.is_read_op = is_read_op
+            return task_op
         elif isinstance(compute_strategy, ActorPoolStrategy):
             from ray.data._internal.execution.operators import (
                 get_actor_pool_map_operator_cls,
@@ -483,6 +507,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 ray_remote_args=ray_remote_args,
                 on_start=on_start,
                 default_logical_memory_enabled=data_context.default_map_logical_memory_enabled,
+                is_read_op=is_read_op,
             )
         else:
             raise ValueError(f"Unsupported execution strategy {compute_strategy}")
@@ -491,14 +516,22 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self,
         options: "ExecutionOptions",
         block_ref_counter: "BlockRefCounter",
+        resource_bank: Optional[ResourceBankBase] = None,
     ):
-        super().start(options, block_ref_counter)
+        super().start(options, block_ref_counter, resource_bank=resource_bank)
         # Create output queue with desired ordering semantics.
-        if options.preserve_order:
-            self._output_queue = ReorderingBundleQueue()
-        else:
-            self._output_queue = FIFOBundleQueue()
+        self._output_queue = self._create_output_queue(options.preserve_order)
+        self._apply_additional_block_split()
 
+    def _create_output_queue(self, preserve_order: bool) -> BaseBundleQueue:
+        """Build the operator's output queue. Overridable so a backend can pick a
+        different implementation (e.g. the actor-only backend uses a priority
+        queue that serves draining actors' outputs first)."""
+        if preserve_order:
+            return ReorderingBundleQueue()
+        return FIFOBundleQueue()
+
+    def _apply_additional_block_split(self) -> None:
         map_transformer = self._map_transformer
         # Apply additional block split if needed.
         if self.get_additional_split_factor() > 1:
@@ -538,6 +571,16 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._block_ref_bundler.add(refs)
         self._metrics.on_input_queued(refs, input_index=0)
 
+        self._maybe_dispatch_next_bundle()
+
+    def _maybe_dispatch_next_bundle(self) -> None:
+        """Dispatch a task for the next full bundle, if the bundler has one.
+
+        Extension point used after each input is added. The base (push)
+        implementation self-dispatches a task as soon as a full bundle is
+        available. The actor-only backend overrides this so inputs are instead
+        enqueued for the scheduling loop to pull via ``launch_task()``.
+        """
         if self._block_ref_bundler.has_next():
             # The ref bundler combines one or more `RefBundle`s into a new
             # `RefBundle`. To update metrics appropriately, we need to deque
@@ -549,23 +592,25 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             for bundle in input_refs:
                 self._metrics.on_input_dequeued(bundle, input_index=0)
 
-            # If the bundler has a full bundle, add it to the operator's task submission
-            # queue
-            #
-            # NOTE: This is a strict path, hence operator is *required* to launch
-            #       at least 1 task
-            self._try_schedule_task(bundled_input, strict=True)
+            # If the bundler has a full bundle, add it to the operator's task
+            # submission queue.
+            self._try_schedule_task(bundled_input, strict=False)
 
     def _get_dynamic_ray_remote_args(
-        self, input_bundle: Optional[RefBundle] = None
+        self,
+        input_bundle: Optional[RefBundle] = None,
+        invoke_ray_remote_args_fn: bool = True,
     ) -> Dict[str, Any]:
         ray_remote_args = copy.deepcopy(self._ray_remote_args)
 
         # max_calls isn't supported in `.options()`, so we remove it when generating dynamic ray_remote_args
         ray_remote_args.pop("max_calls", None)
 
-        # Override parameters from user provided remote args function.
-        if self._ray_remote_args_fn:
+        # Override parameters from user provided remote args function. Skipped by
+        # callers that only inspect the args (e.g. issue detectors): the fn may
+        # have side effects -- vLLM's engine fn mints a real placement group on
+        # every call -- so it must run only when actually creating a task/actor.
+        if invoke_ray_remote_args_fn and self._ray_remote_args_fn:
             new_remote_args = self._ray_remote_args_fn()
             for k, v in new_remote_args.items():
                 ray_remote_args[k] = v
@@ -606,7 +651,10 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self,
         gen: ObjectRefGenerator,
         inputs: RefBundle,
-        task_done_callback: Optional[Callable[[], None]] = None,
+        task_output_ready_callback: Optional[Callable[[RefBundle], None]] = None,
+        task_done_callback: Optional[
+            Callable[[RefBundle, int, Optional[Exception]], None]
+        ] = None,
     ):
         """Submit a new data-handling task."""
         # TODO(hchen):
@@ -626,8 +674,13 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             self._metrics.on_task_output_generated(task_index, output)
 
             # Notify output queue that the task has produced an new output.
-            self._output_queue.add(output, key=task_index)
+            # ``_output_add_kwargs`` lets subclasses tag the bundle differently
+            # (e.g. the actor-only backend keys by producing actor id).
+            self._output_queue.add(output, **self._output_add_kwargs(task_index))
             self._metrics.on_output_queued(output)
+
+            if task_output_ready_callback:
+                task_output_ready_callback(output)
 
         def _task_done_callback(
             task_index: int,
@@ -641,7 +694,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             assert exception or (
                 task_exec_driver_stats
             ), "Driver's task execution stats must be provided on task's successful completion"
-
+            inputs = self._metrics._running_tasks[task_index].inputs
             self._metrics.on_task_finished(
                 task_index, exception, task_exec_stats, task_exec_driver_stats
             )
@@ -659,8 +712,9 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             self._data_tasks.pop(task_index)
             # Notify output queue that this task is complete.
             self._output_queue.finalize(key=task_index)
+
             if task_done_callback:
-                task_done_callback()
+                task_done_callback(inputs, task_index, exception)
 
         data_task = DataOpTask(
             task_index,
@@ -729,9 +783,15 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
     def _get_next_inner(self) -> RefBundle:
         assert self._started
         bundle = self._output_queue.get_next()
+        self._record_output_dequeued(bundle)
+        return bundle
+
+    def _record_output_dequeued(self, bundle: RefBundle) -> None:
         self._metrics.on_output_dequeued(bundle)
         self._output_blocks_stats.extend(to_stats(bundle.metadata))
-        return bundle
+
+    def _output_add_kwargs(self, task_index: int) -> Dict[str, Any]:
+        return {"key": task_index}
 
     @abstractmethod
     def progress_str(self) -> str:
@@ -785,6 +845,7 @@ def _map_task(
     data_context: DataContext,
     ctx: TaskContext,
     *blocks: Block,
+    actor_id: LogicalActorId | None = None,
     slices: Optional[List[BlockSlice]] = None,
     **kwargs: Dict[str, Any],
 ) -> Iterator[Union[Block, "BlockMetadataWithSchema"]]:
@@ -797,6 +858,7 @@ def _map_task(
         ctx: The :class:`TaskContext` for the task, used to look up
             per-task settings and propagate context to the UDF.
         *blocks: The concrete block values from the task ref bundle.
+        actor_id: The globally unique logical actor id created by Ray Data.
         slices: List of block slices for this task to process.
         **kwargs: Additional keyword arguments stored on ``ctx.kwargs`` and
             forwarded to the map transformer.
@@ -874,6 +936,7 @@ def _map_task(
                         block_ser_time_s=block_ser_time_s,
                         udf_time_s=map_transformer.udf_time_s(reset=True),
                         task_idx=ctx.task_idx,
+                        actor_id=actor_id,
                     )
                     # NOTE: This tracks task duration up to this point, though we're
                     # primarily interested in task total duration.
@@ -921,6 +984,12 @@ def _canonicalize_ray_remote_args(ray_remote_args: Dict[str, Any]) -> Dict[str, 
         )
 
     if "num_cpus" not in ray_remote_args and "num_gpus" not in ray_remote_args:
+        ray_remote_args["num_cpus"] = 1
+    elif "num_cpus" not in ray_remote_args and ray_remote_args.get("num_gpus"):
+        # A GPU map op left at the default reserves 0 CPU, so the scheduler sees
+        # its node as fully CPU-free and overpacks CPU producers onto it. Reserve
+        # a CPU so the GPU op is accounted on its node. Unconditional (all
+        # backends/tests) -- GPU UDFs always use some CPU.
         ray_remote_args["num_cpus"] = 1
 
     return ray_remote_args

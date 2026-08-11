@@ -353,6 +353,13 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Number of failed tasks.",
         metrics_group=MetricsGroup.TASKS,
     )
+    num_blocks_retried: int = metric_field(
+        default=0,
+        description="Number of input blocks re-dispatched to a different actor "
+        "after their actor was deliberately terminated (drained/force-killed) "
+        "mid-task.",
+        metrics_group=MetricsGroup.TASKS,
+    )
 
     task_scheduling_time_task_locality_hit_s: float = metric_field(
         default=0,
@@ -515,6 +522,34 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Number of tasks currently being processed by actors.",
         metrics_group=MetricsGroup.ACTORS,
     )
+    # OperatorSizer actor-scaling churn, split by direction (the magnitude is in
+    # the metric name since OpRuntimeMetrics gauges are keyed only by
+    # (dataset, operator)). ``how_many`` is what scale_how_many requested;
+    # ``where`` is what scale_where placed.
+    sizer_actor_delta_how_many_up: int = metric_field(
+        default=0,
+        description="Cumulative actors the OperatorSizer's scale_how_many "
+        "requested adding (upscales).",
+        metrics_group=MetricsGroup.ACTORS,
+    )
+    sizer_actor_delta_how_many_down: int = metric_field(
+        default=0,
+        description="Cumulative actors the OperatorSizer's scale_how_many "
+        "requested removing (downscales).",
+        metrics_group=MetricsGroup.ACTORS,
+    )
+    sizer_actor_delta_where_up: int = metric_field(
+        default=0,
+        description="Cumulative actors the OperatorSizer's scale_where placed "
+        "(upscales).",
+        metrics_group=MetricsGroup.ACTORS,
+    )
+    sizer_actor_delta_where_down: int = metric_field(
+        default=0,
+        description="Cumulative actors the OperatorSizer's scale_where removed "
+        "(downscales).",
+        metrics_group=MetricsGroup.ACTORS,
+    )
 
     # === Object store memory metrics ===
     obj_store_mem_internal_inqueue_blocks: int = metric_field(
@@ -541,6 +576,20 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         default=0,
         description="Byte size of used memory in object store.",
         metrics_group=MetricsGroup.OBJECT_STORE_MEMORY,
+    )
+    bytes_remote_inputs_read: int = metric_field(
+        default=0,
+        description="Cumulative input bytes this operator's actors read from a "
+        "node other than the actor's node (cross-node object transfer).",
+        metrics_group=MetricsGroup.OBJECT_STORE_MEMORY,
+        map_only=True,
+    )
+    num_remote_blocks_read: int = metric_field(
+        default=0,
+        description="Cumulative number of input blocks this operator's actors "
+        "read cross-node (from a node other than the actor's node).",
+        metrics_group=MetricsGroup.OBJECT_STORE_MEMORY,
+        map_only=True,
     )
 
     # === Miscellaneous metrics ===

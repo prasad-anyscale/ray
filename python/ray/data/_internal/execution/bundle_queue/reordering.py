@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import TYPE_CHECKING, DefaultDict, Deque, Optional, Set
+from typing import TYPE_CHECKING, DefaultDict, Deque, Optional, Set, Tuple
 
 from typing_extensions import override
 
@@ -66,6 +66,25 @@ class ReorderingBundleQueue(BaseBundleQueue):
             raise ValueError("Cannot pop from empty queue.")
 
         return self._inner[self._current_key].popleft()
+
+    def get_next_with_key(self) -> Tuple[RefBundle, int]:
+        """Pop the next bundle and return it together with its key (the producing
+        task index).
+
+        NOTE: This exists ONLY for the actor-only backend's drain-consumption
+        gate. ``ExperimentalAPMO`` maps the returned task index to the producing
+        actor (via its task->actor table) to decrement that actor's
+        unconsumed-output count so a draining actor isn't killed until its output
+        blocks are consumed. It carries no ordering/priority semantics -- it's a
+        thin accessor over the key this queue already tracks.
+        """
+        # ``has_next`` may advance ``_current_key`` past exhausted/finalized keys.
+        if not self.has_next():
+            raise ValueError("Cannot pop from empty queue.")
+        key = self._current_key
+        bundle = self._inner[key].popleft()
+        self._on_dequeue_bundle(bundle)
+        return bundle, key
 
     @override
     def peek_next(self) -> Optional[RefBundle]:

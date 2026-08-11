@@ -6,10 +6,11 @@ import pyarrow as pa
 
 from ray._common.utils import env_integer
 from ray.data._internal.compute import ActorPoolStrategy, TaskPoolStrategy
-from ray.data._internal.execution.interfaces import PhysicalOperator
-from ray.data._internal.execution.operators.actor_pool_map_operator import (
-    ActorPoolMapOperator,
+from ray.data._internal.execution.execution_flags import (
+    actor_only_backend_enabled,
 )
+from ray.data._internal.execution.interfaces import PhysicalOperator
+from ray.data._internal.execution.operators import get_actor_pool_map_operator_cls
 from ray.data._internal.execution.operators.map_operator import MapOperator
 from ray.data._internal.execution.operators.map_transformer import (
     BlockMapTransformFn,
@@ -157,7 +158,7 @@ def plan_download_op(
             init_fn=init_fn,
         )
 
-        metadata_map_operator = ActorPoolMapOperator(
+        metadata_map_operator = get_actor_pool_map_operator_cls()(
             metadata_map_transformer,
             split_map_operator,
             data_context,
@@ -165,8 +166,15 @@ def plan_download_op(
             # NOTE: The metadata planning actor doesn't use the user-provided
             #       `ray_remote_args` since those only apply to the actual
             #       download tasks. Planning is a lightweight internal operation
-            #       that doesn't need custom resource requirements.
-            ray_remote_args=None,
+            #       that doesn't need custom resource requirements. It moves no
+            #       data, so under the actor-only backend the actor-wide
+            #       generator cap (core actor backpressure) is disabled too --
+            #       actor-creation-only option, set only when ops run as actors.
+            ray_remote_args=(
+                {"_actor_generator_backpressure_num_objects": -1}
+                if actor_only_backend_enabled()
+                else None
+            ),
             compute_strategy=metadata_compute,
             # NOTE: Let each metadata actor stream emitted download blocks without
             #       generator-object backpressure. Downstream operator

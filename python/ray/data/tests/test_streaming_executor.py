@@ -33,6 +33,7 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.execution.interfaces.physical_operator import (
     DataOpTask,
     MetadataOpTask,
+    TaskPullRequest,
 )
 from ray.data._internal.execution.metadata_fetcher import (
     InlineMetadataFetcher,
@@ -816,13 +817,13 @@ def test_select_ops_to_run(ray_start_regular_shared):
 def test_dispatch_next_task(ray_start_regular_shared):
     inputs = make_ref_bundles([[x] for x in range(20)])
     o1 = InputDataBuffer(DataContext.get_current(), inputs)
-    o1_state = OpState(o1, [])
+    o1_state = OpState(o1, [], index=0)
     o2 = MapOperator.create(
         make_map_transformer(lambda block: [b * -1 for b in block]),
         o1,
         DataContext.get_current(),
     )
-    op_state = OpState(o2, [o1_state.output_queue])
+    op_state = OpState(o2, [o1_state.output_queue], index=1)
 
     # TODO: test multiple inqueues with the union operator.
     ref1 = make_ref_bundle("dummy1")
@@ -1339,10 +1340,7 @@ def test_create_topology_metadata():
     )
 
     # Call the _dump_dag_structure method
-    op_to_id = {
-        op: executor._get_operator_id(op, i)
-        for i, op in enumerate(executor._topology.keys())
-    }
+    op_to_id = {op: op_state.op_tag() for op, op_state in executor._topology.items()}
     topology_metadata = TopologyMetadata.create_topology_metadata(o3, op_to_id)
 
     # Verify the structure of the returned dictionary
@@ -1404,10 +1402,7 @@ def test_create_topology_metadata_with_sub_stages():
     )
 
     # Get the DAG structure
-    op_to_id = {
-        op: executor._get_operator_id(op, i)
-        for i, op in enumerate(executor._topology.keys())
-    }
+    op_to_id = {op: op_state.op_tag() for op, op_state in executor._topology.items()}
     topology_metadata = TopologyMetadata.create_topology_metadata(o2, op_to_id)
 
     # Find the operator with sub-stages (appears as "Map" in the structure)
@@ -1520,8 +1515,11 @@ class TestDataOpTask:
         bytes_read = 0
         while not data_op_task.has_finished:
             ray.wait([streaming_gen], fetch_local=False)
-            nbytes_read = data_op_task.on_data_ready(None, InlineMetadataFetcher())
-            bytes_read += nbytes_read
+            response = data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            )
+            bytes_read += response.bytes_read
 
         assert bytes_read == pytest.approx(128 * MiB)
 
@@ -1542,8 +1540,11 @@ class TestDataOpTask:
         bytes_read = 0
         while not data_op_task.has_finished:
             ray.wait([streaming_gen], fetch_local=False)
-            nbytes_read = data_op_task.on_data_ready(None, InlineMetadataFetcher())
-            bytes_read += nbytes_read
+            response = data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            )
+            bytes_read += response.bytes_read
 
         assert bytes_read == pytest.approx(256 * MiB)
 
@@ -1572,7 +1573,10 @@ class TestDataOpTask:
         with pytest.raises(AssertionError, match="Block generation failed"):
             while not data_op_task.has_finished:
                 ray.wait([streaming_gen], fetch_local=False)
-                data_op_task.on_data_ready(None, InlineMetadataFetcher())
+                data_op_task.on_data_ready(
+                    max_to_read=TaskPullRequest.inf(),
+                    metadata_fetcher=InlineMetadataFetcher(),
+                )
 
     def test_operator_name_parameter(self, ray_start_regular_shared):
         streaming_gen = create_stub_streaming_gen(block_nbytes=[1])
@@ -1605,7 +1609,7 @@ class TestDataOpTask:
 
         ray.wait([streaming_gen], fetch_local=False)
         fetcher = ThreadedMetadataFetcher()
-        task.on_data_ready(None, fetcher)
+        task.on_data_ready(max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher)
 
         # The pair was deferred: no emit yet, _last_block_meta still None.
         assert outputs == []
@@ -1661,7 +1665,9 @@ class TestDataOpTask:
             deadline = time.time() + 30
             for op_key, task in (("a", task_a), ("b", task_b)):
                 while not task.is_drained() and time.time() < deadline:
-                    task.on_data_ready(None, fetcher)
+                    task.on_data_ready(
+                        max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+                    )
                     time.sleep(0.01)
                 fetcher.submit(op_key, [task])
             assert task_a.is_drained() and task_b.is_drained()
@@ -1707,7 +1713,9 @@ class TestDataOpTask:
         fetcher = ThreadedMetadataFetcher()
         deadline = time.time() + 30
         while not task.is_drained() and time.time() < deadline:
-            task.on_data_ready(None, fetcher)
+            task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+            )
             time.sleep(0.01)
         deferred = list(fetcher._pending_deferred)
         assert len(deferred) == 2
@@ -1752,7 +1760,9 @@ class TestDataOpTask:
         fetcher = ThreadedMetadataFetcher()
         deadline = time.time() + 30
         while not task.is_drained() and time.time() < deadline:
-            task.on_data_ready(None, fetcher)
+            task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+            )
             time.sleep(0.01)
         deferred = list(fetcher._pending_deferred)
         assert len(deferred) == 2
@@ -1797,7 +1807,9 @@ class TestDataOpTask:
         try:
             deadline = time.time() + 30
             while not task.is_drained() and time.time() < deadline:
-                task.on_data_ready(None, fetcher)
+                task.on_data_ready(
+                    max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+                )
                 time.sleep(0.01)
             assert task.is_drained()
 
@@ -1879,7 +1891,10 @@ class TestDataOpTask:
         deadline = time.time() + 30
         bytes_read = 0
         while task.pending_meta_ref.is_nil() and time.time() < deadline:
-            bytes_read += task.on_data_ready(None, fetcher)
+            response = task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+            )
+            bytes_read += response.bytes_read
             time.sleep(0.01)
         assert not task.pending_block_ref.is_nil()
         assert bytes_read == 0
@@ -1891,7 +1906,10 @@ class TestDataOpTask:
         stage["n"] = 2
         deadline = time.time() + 30
         while not task.is_drained() and time.time() < deadline:
-            bytes_read += task.on_data_ready(None, fetcher)
+            response = task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+            )
+            bytes_read += response.bytes_read
             time.sleep(0.01)
         assert bytes_read == 108
         assert len(fetcher._pending_deferred) == 1
@@ -1927,7 +1945,9 @@ class TestDataOpTask:
 
         deadline = time.time() + 30
         while not task.is_drained() and time.time() < deadline:
-            task.on_data_ready(None, fetcher)
+            task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fetcher
+            )
             time.sleep(0.01)
 
         # The size-less pair was consumed (size 0, not None) and deferred
@@ -1980,7 +2000,12 @@ class TestDataOpTask:
 
         # 1st call: fetcher reports not-ready -> nothing charged, not finished,
         # the pair's refs are retained for a retry.
-        assert task.on_data_ready(None, fake) == 0
+        assert (
+            task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fake
+            ).bytes_read
+            == 0
+        )
         assert emits == [] and done == [] and not task.has_finished
         assert not task._pending_block_ref.is_nil()
 
@@ -1990,7 +2015,10 @@ class TestDataOpTask:
         deadline = time.time() + 30
         while not task.has_finished and time.time() < deadline:
             ray.wait([gen], fetch_local=False)
-            bytes_read += task.on_data_ready(None, fake)
+            response = task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(), metadata_fetcher=fake
+            )
+            bytes_read += response.bytes_read
         assert bytes_read == 4096
         assert len(emits) == 1
         assert len(done) == 1
@@ -2051,7 +2079,11 @@ class TestDataOpTask:
         bytes_read = 0
         while not data_op_task.has_finished:
             ray.wait([streaming_gen], fetch_local=False)
-            bytes_read += data_op_task.on_data_ready(None, InlineMetadataFetcher())
+            response = data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            )
+            bytes_read += response.bytes_read
 
         # Ensure that we read the expected amount of data. Since the streaming generator
         # yields a single 128 MiB block, we should read 128 MiB.
@@ -2081,15 +2113,22 @@ class TestDataOpTask:
         cluster.remove_node(worker_node)
 
         # The block shouldn't be available anymore, so we shouldn't read any data.
-        bytes_read = data_op_task.on_data_ready(None, InlineMetadataFetcher())
-        assert bytes_read == 0
+        response = data_op_task.on_data_ready(
+            max_to_read=TaskPullRequest.inf(), metadata_fetcher=InlineMetadataFetcher()
+        )
+        assert response.bytes_read == 0
 
         # Re-add the worker node, and run the task to completion.
         new_worker_node = cluster.add_node(num_cpus=1)  # noqa: F841
         cluster.wait_for_nodes()
+        bytes_read = 0
         while not data_op_task.has_finished:
             ray.wait([streaming_gen], fetch_local=False)
-            bytes_read += data_op_task.on_data_ready(None, InlineMetadataFetcher())
+            response = data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            )
+            bytes_read += response.bytes_read
 
         # We should now be able to read the 128 MiB block.
         assert bytes_read == pytest.approx(128 * MiB)
@@ -2131,20 +2170,30 @@ class TestDataOpTask:
         # 1st backpressure period: 2.5s
         clock = 1.0
         mock_perf_counter.return_value = clock
-        assert data_op_task.on_data_ready(0, InlineMetadataFetcher()) == 0
+        assert (
+            data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.zero(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            ).bytes_read
+            == 0
+        )
 
         clock = 3.5
         mock_perf_counter.return_value = clock
 
         # Resume: ends 1st BP period (2.5s), reads block 1 (limited to 1 byte
         # so it reads exactly one block and stops)
-        data_op_task.on_data_ready(None, InlineMetadataFetcher())
+        data_op_task.on_data_ready(
+            max_to_read=TaskPullRequest.inf(), metadata_fetcher=InlineMetadataFetcher()
+        )
         assert not data_op_task.has_finished
 
         # 2nd backpressure period: 1.5s
         clock = 5.0
         mock_perf_counter.return_value = clock
-        data_op_task.on_data_ready(0, InlineMetadataFetcher())
+        data_op_task.on_data_ready(
+            max_to_read=TaskPullRequest.zero(), metadata_fetcher=InlineMetadataFetcher()
+        )
 
         clock = 6.5
         mock_perf_counter.return_value = clock
@@ -2152,7 +2201,10 @@ class TestDataOpTask:
         # Drain to completion
         while not data_op_task.has_finished:
             ray.wait([streaming_gen], fetch_local=False)
-            data_op_task.on_data_ready(None, InlineMetadataFetcher())
+            data_op_task.on_data_ready(
+                max_to_read=TaskPullRequest.inf(),
+                metadata_fetcher=InlineMetadataFetcher(),
+            )
 
         # Verify stats were captured
         assert captured_stats["exc"] is None

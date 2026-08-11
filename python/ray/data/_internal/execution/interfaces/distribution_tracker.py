@@ -25,9 +25,11 @@ class DistributionTracker:
         self._min = float("inf")
         self._max = float("-inf")
         self._sketch = kll_doubles_sketch(200) if _DATASKETCHES_AVAILABLE else None
+        self._sum = 0.0
 
     def add_sample(self, value: float) -> None:
         self._count += 1
+        self._sum += value
 
         delta = value - self._mean
         self._mean += delta / self._count
@@ -48,6 +50,7 @@ class DistributionTracker:
         Uses Chan's parallel variant of Welford's algorithm for moments.
         See: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford:~:text=Parallel%20algorithm%5Bedit%5D
         """
+        self._sum += other._sum
         if other is self:
             # Merging an accumulator into itself would double its samples
             # (count, m2, and the sketch), so treat it as a no-op.
@@ -136,6 +139,10 @@ class DistributionTracker:
     @property
     def p99(self) -> Optional[float]:
         return self._quantile(0.99)
+
+    @property
+    def sum(self) -> float:
+        return self._sum
 
     def as_dict(self) -> Dict[str, Optional[Union[int, float]]]:
         return {

@@ -72,6 +72,12 @@ class InternalQueueOperatorMixin(PhysicalOperator, abc.ABC):
         self.clear_internal_input_queue()
         self.clear_internal_output_queue()
 
+    def min_num_rows_needed_to_make_progress(self) -> int:
+        """Some operators, like ExperimentalAPMO and OutputSplitter(equal=True)
+        require a certain # of rows before it can launch a task/pass the input into
+        the output queue. This is used in idle detection"""
+        return 0
+
 
 class OneToOneOperator(PhysicalOperator):
     """An operator that has one input and one output dependency.

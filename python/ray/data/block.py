@@ -24,6 +24,7 @@ import numpy as np
 import pyarrow as pa
 
 import ray
+from ray.data._internal.execution.interfaces.common import LogicalActorId
 from ray.data._internal.util import _check_pyarrow_version, _truncated_repr
 from ray.data.context import DataContext
 from ray.types import ObjectRef
@@ -231,6 +232,8 @@ class BlockExecStats:
     # to individual tasks in per-task statistics.
     task_idx: Optional[int] = None
 
+    actor_id: Optional[LogicalActorId] = None
+
     # Ray node ID of the worker that produced this block.
     node_id: str = field(
         default_factory=lambda: ray.runtime_context.get_runtime_context().get_node_id()
@@ -294,8 +297,9 @@ class BlockStats:
     num_rows: Optional[int]
     # The approximate size in bytes of this block, or None.
     size_bytes: Optional[int]
-    # Execution stats for this block.
-    exec_stats: Optional[BlockExecStats]
+    # Execution stats for this block. TODO(Justin): Make sure this is
+    # non-None
+    exec_stats: BlockExecStats
 
     # Overall task execution stats (reported from the worker).
     task_exec_stats: Optional[TaskExecWorkerStats] = field(default=None)
@@ -331,6 +335,15 @@ class BlockMetadata(BlockStats):
         return BlockStats(
             **{key: self.__getattribute__(key) for key in _BLOCK_STATS_FIELD_NAMES}
         )
+
+    def get_task_index(self) -> int | None:
+        return self.exec_stats.task_idx
+
+    def get_actor_id(self) -> LogicalActorId | None:
+        return self.exec_stats.actor_id
+
+    def get_node_id(self) -> str:
+        return self.exec_stats.node_id
 
 
 @functools.lru_cache(maxsize=128)

@@ -53,7 +53,10 @@ def test_report_issues():
         data_context=ctx,
         ray_remote_args={},
     )
-    topology = {input_operator: MagicMock(), map_operator: MagicMock()}
+    input_state, map_state = MagicMock(), MagicMock()
+    input_state.op_tag.return_value = f"{input_operator.name}_0"
+    map_state.op_tag.return_value = f"{map_operator.name}_1"
+    topology = {input_operator: input_state, map_operator: map_state}
     executor = StreamingExecutor(ctx)
     executor._topology = topology
     detector = IssueDetectorManager(executor)
