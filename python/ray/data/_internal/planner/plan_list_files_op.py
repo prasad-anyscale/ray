@@ -47,7 +47,7 @@ from ray.data._internal.execution.operators.map_transformer import (
     MapTransformFn,
 )
 from ray.data._internal.logical.operators import ListFiles
-from ray.data.block import Block, BlockAccessor
+from ray.data.block import Block, BlockAccessor, BlockExecStats
 from ray.data.context import DataContext
 
 logger = logging.getLogger(__name__)
@@ -208,8 +208,12 @@ def _create_input_data_buffer(
         if not paths:
             continue
         block = pa.Table.from_pydict({PATH_COLUMN_NAME: paths})
+        # The driver puts these listing blocks in its own object store, so stamp
+        # them with the local node. Object-store accounting attributes every
+        # block to the node that produced it, and a listing block with no
+        # execution stats has no node to attribute it to.
         metadata = BlockAccessor.for_block(block).get_metadata(
-            input_files=None, block_exec_stats=None
+            input_files=None, block_exec_stats=BlockExecStats()
         )
         block_ref: ray.ObjectRef[Block] = ray.put(block)
         ref_bundle = RefBundle(
